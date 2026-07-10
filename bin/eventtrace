@@ -1,0 +1,25 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Golovanov\Cli\EventTraceCommand;
+
+$autoloadCandidates = [
+    __DIR__ . '/../vendor/autoload.php',
+    __DIR__ . '/../../../autoload.php',
+];
+
+foreach ($autoloadCandidates as $autoload) {
+    if (is_file($autoload)) {
+        require $autoload;
+        break;
+    }
+}
+
+if (!class_exists(EventTraceCommand::class)) {
+    fwrite(STDERR, "Unable to load Traceloom. Run composer install first.\n");
+    exit(1);
+}
+
+exit((new EventTraceCommand())->run($argv));
