@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Golovanov\Tests\TestSupport;
+namespace Golovanov\Traceloom\Tests\TestSupport;
 
 final class TempDirectory
 {

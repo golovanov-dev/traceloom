@@ -3,7 +3,7 @@
 
 declare(strict_types=1);
 
-use Golovanov\Cli\EventTraceCommand;
+use Golovanov\Traceloom\Cli\EventTraceCommand;
 
 $autoloadCandidates = [
     __DIR__ . '/../vendor/autoload.php',

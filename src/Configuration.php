@@ -2,15 +2,37 @@
 
 declare(strict_types=1);
 
-namespace Golovanov;
+namespace Golovanov\Traceloom;
 
-use Golovanov\Exception\ConfigurationException;
+use Golovanov\Traceloom\Exception\ConfigurationException;
 
 final class Configuration
 {
     public const DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024;
     public const DEFAULT_MAX_STRING_BYTES = 64 * 1024;
+    public const DEFAULT_MAX_RECORD_BYTES = 256 * 1024;
+    public const DEFAULT_MAX_ARRAY_ITEMS = 1000;
+    public const DEFAULT_MAX_DEPTH = 16;
+    public const DEFAULT_DIRECTORY_MODE = 0750;
+    public const DEFAULT_FILE_MODE = 0640;
+
     public const REDACTED = '[REDACTED]';
+
+    /**
+     * Canonical fragments that mark a key as sensitive when it contains them.
+     * Only consulted when $strictSensitiveKeys is false.
+     *
+     * @var list<string>
+     */
+    private const SENSITIVE_KEY_FRAGMENTS = [
+        'password',
+        'passwd',
+        'secret',
+        'token',
+        'apikey',
+        'privatekey',
+        'credential',
+    ];
 
     /** @var list<string> */
     private const DEFAULT_SENSITIVE_KEYS = [
@@ -21,77 +43,163 @@ final class Configuration
         'access_token',
         'refresh_token',
         'authorization',
+        'proxy_authorization',
         'cookie',
+        'set_cookie',
         'api_key',
+        'x_api_key',
         'secret',
         'client_secret',
+        'private_key',
+        'credentials',
+        'signature',
+        'session_id',
+        'csrf',
+        'csrf_token',
     ];
 
     /**
-     * @param list<string> $sensitiveKeys
+     * @param array<string, true> $sensitiveKeyMap Canonicalized keys, see canonicalizeKey().
      */
     private function __construct(
         public readonly string $logDirectory,
         public readonly int $maxFileBytes,
         public readonly int $maxStringBytes,
-        public readonly array $sensitiveKeys,
+        public readonly int $maxRecordBytes,
+        public readonly int $maxArrayItems,
+        public readonly int $maxDepth,
+        public readonly array $sensitiveKeyMap,
+        public readonly bool $strictSensitiveKeys,
+        public readonly int $directoryMode,
+        public readonly int $fileMode,
+        public readonly int $retentionDays,
+        public readonly bool $trustIncomingTraceId,
         public readonly bool $failOnError,
         public readonly ?\Closure $onError,
     ) {
     }
 
     /**
-     * @param list<string> $sensitiveKeys
+     * @param list<string> $sensitiveKeys Merged with the built-in defaults.
      */
     public static function create(
         string $logDirectory,
         int $maxFileBytes = self::DEFAULT_MAX_FILE_BYTES,
         int $maxStringBytes = self::DEFAULT_MAX_STRING_BYTES,
+        int $maxRecordBytes = self::DEFAULT_MAX_RECORD_BYTES,
+        int $maxArrayItems = self::DEFAULT_MAX_ARRAY_ITEMS,
+        int $maxDepth = self::DEFAULT_MAX_DEPTH,
         array $sensitiveKeys = [],
+        bool $strictSensitiveKeys = false,
+        int $directoryMode = self::DEFAULT_DIRECTORY_MODE,
+        int $fileMode = self::DEFAULT_FILE_MODE,
+        int $retentionDays = 0,
+        bool $trustIncomingTraceId = true,
         bool $failOnError = false,
         ?callable $onError = null,
     ): self {
-        $logDirectory = rtrim(trim($logDirectory), "\\/");
+        $logDirectory = self::normalizeDirectory($logDirectory);
 
-        if ($logDirectory === '') {
-            throw new ConfigurationException('Log directory must not be empty.');
+        self::assertPositive($maxFileBytes, 'Max file size');
+        self::assertPositive($maxStringBytes, 'Max string size');
+        self::assertPositive($maxRecordBytes, 'Max record size');
+        self::assertPositive($maxArrayItems, 'Max array items');
+        self::assertPositive($maxDepth, 'Max depth');
+
+        if ($retentionDays < 0) {
+            throw new ConfigurationException('Retention days must not be negative.');
         }
 
-        if ($maxFileBytes <= 0) {
-            throw new ConfigurationException('Max file size must be greater than zero.');
-        }
-
-        if ($maxStringBytes <= 0) {
-            throw new ConfigurationException('Max string size must be greater than zero.');
-        }
-
-        $keys = self::normalizeSensitiveKeys([...self::DEFAULT_SENSITIVE_KEYS, ...$sensitiveKeys]);
+        // Clamped rather than rejected: a small maxFileBytes is a legitimate choice, and
+        // it should tighten the record limit instead of invalidating the whole config.
+        // Keeping maxRecordBytes <= maxFileBytes is what guarantees a single event can
+        // never overflow a shard, so rotation cannot degrade into one file per event.
+        $maxRecordBytes = min($maxRecordBytes, $maxFileBytes);
+        $maxStringBytes = min($maxStringBytes, $maxRecordBytes);
 
         return new self(
             logDirectory: $logDirectory,
             maxFileBytes: $maxFileBytes,
             maxStringBytes: $maxStringBytes,
-            sensitiveKeys: $keys,
+            maxRecordBytes: $maxRecordBytes,
+            maxArrayItems: $maxArrayItems,
+            maxDepth: $maxDepth,
+            sensitiveKeyMap: self::buildSensitiveKeyMap([...self::DEFAULT_SENSITIVE_KEYS, ...$sensitiveKeys]),
+            strictSensitiveKeys: $strictSensitiveKeys,
+            directoryMode: $directoryMode,
+            fileMode: $fileMode,
+            retentionDays: $retentionDays,
+            trustIncomingTraceId: $trustIncomingTraceId,
             failOnError: $failOnError,
             onError: $onError === null ? null : \Closure::fromCallable($onError),
         );
     }
 
     /**
-     * @param list<string> $keys
+     * Reduces a payload key to a comparable form so that `X-Api-Key`, `api_key`,
+     * `apiKey` and `APIKEY` all collapse to `apikey`.
+     */
+    public static function canonicalizeKey(string $key): string
+    {
+        $lowered = strtolower($key);
+        $canonical = preg_replace('/[^a-z0-9]+/', '', $lowered);
+
+        return $canonical ?? '';
+    }
+
+    /**
      * @return list<string>
      */
-    private static function normalizeSensitiveKeys(array $keys): array
+    public static function sensitiveKeyFragments(): array
     {
-        $normalized = [];
+        return self::SENSITIVE_KEY_FRAGMENTS;
+    }
+
+    private static function normalizeDirectory(string $logDirectory): string
+    {
+        $logDirectory = trim($logDirectory);
+
+        if ($logDirectory === '') {
+            throw new ConfigurationException('Log directory must not be empty.');
+        }
+
+        $normalized = rtrim($logDirectory, "\\/");
+
+        // rtrim() eats the whole path for filesystem roots: "/" and "C:\".
+        if ($normalized === '') {
+            return DIRECTORY_SEPARATOR;
+        }
+
+        if (preg_match('/^[A-Za-z]:$/', $normalized) === 1) {
+            return $normalized . DIRECTORY_SEPARATOR;
+        }
+
+        return $normalized;
+    }
+
+    private static function assertPositive(int $value, string $label): void
+    {
+        if ($value <= 0) {
+            throw new ConfigurationException($label . ' must be greater than zero.');
+        }
+    }
+
+    /**
+     * @param list<string> $keys
+     * @return array<string, true>
+     */
+    private static function buildSensitiveKeyMap(array $keys): array
+    {
+        $map = [];
 
         foreach ($keys as $key) {
-            $key = strtolower(trim($key));
-            if ($key !== '') {
-                $normalized[$key] = $key;
+            $canonical = self::canonicalizeKey($key);
+
+            if ($canonical !== '') {
+                $map[$canonical] = true;
             }
         }
 
-        return array_values($normalized);
+        return $map;
     }
 }

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Golovanov\Exception;
+namespace Golovanov\Traceloom\Exception;
 
 final class TracingException extends \RuntimeException implements TraceloomException
 {

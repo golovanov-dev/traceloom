@@ -2,26 +2,32 @@
 
 declare(strict_types=1);
 
-namespace Golovanov;
+namespace Golovanov\Traceloom;
 
-use Golovanov\Clock\ClockInterface;
-use Golovanov\Exception\TracingException;
-use Golovanov\Sanitizer\PayloadSanitizer;
-use Golovanov\Writer\WriterInterface;
+use Golovanov\Traceloom\Clock\ClockInterface;
+use Golovanov\Traceloom\Exception\TracingException;
+use Golovanov\Traceloom\Sanitizer\PayloadSanitizer;
+use Golovanov\Traceloom\Support\Utf8;
+use Golovanov\Traceloom\Writer\WriterInterface;
 
 final class Trace
 {
+    private const MAX_NAME_LENGTH = 128;
+    private const INVALID_NAME = '[INVALID_EVENT_NAME]';
+
     private int $sequence = 0;
-    private readonly float $startedAt;
+    private readonly int $startedAtNs;
 
     public function __construct(
         private readonly string $traceId,
+        private readonly ?string $parentTraceId,
         private readonly Configuration $configuration,
         private readonly WriterInterface $writer,
         private readonly PayloadSanitizer $sanitizer,
         private readonly ClockInterface $clock,
+        private readonly Metrics $metrics,
     ) {
-        $this->startedAt = $clock->microtime();
+        $this->startedAtNs = $clock->monotonicNs();
     }
 
     public function id(): string
@@ -29,40 +35,92 @@ final class Trace
         return $this->traceId;
     }
 
+    public function parentId(): ?string
+    {
+        return $this->parentTraceId;
+    }
+
     /**
      * @param array<string, mixed> $data
+     *
+     * @throws TracingException When $name is empty. That is a programming error,
+     *         so it surfaces regardless of failOnError.
      */
     public function event(string $name, array $data = []): void
     {
+        $name = $this->normalizeName($name);
+
+        // Only I/O and payload handling are fail-safe. Everything above this point
+        // is a caller mistake and must surface.
         try {
-            $name = trim($name);
-
-            if ($name === '') {
-                throw new TracingException('Trace event name must not be empty.');
-            }
-
             $now = $this->clock->now();
-            $elapsedMs = max(0.0, ($this->clock->microtime() - $this->startedAt) * 1000);
-            $this->sequence++;
+            $elapsedMs = ($this->clock->monotonicNs() - $this->startedAtNs) / 1_000_000;
 
-            $this->writer->write([
-                'timestamp' => $this->formatTimestamp($now),
-                'trace_id' => $this->traceId,
-                'event' => $name,
-                'sequence' => $this->sequence,
-                'elapsed_ms' => round($elapsedMs, 3),
-                'data' => $this->sanitizer->sanitize($data),
-            ]);
+            $event = new TraceEvent(
+                timestamp: $now,
+                traceId: $this->traceId,
+                parentTraceId: $this->parentTraceId,
+                name: $name,
+                sequence: $this->sequence + 1,
+                elapsedMs: $elapsedMs,
+                data: $this->sanitizer->sanitize($data),
+            );
+
+            $this->writer->write($event);
+        } catch (\Throwable $exception) {
+            $this->metrics->recordDroppedEvent();
+            $this->handleFailure($exception);
+
+            return;
+        }
+
+        // Advanced only after a successful write, so a gap in `sequence` always means
+        // a lost event rather than a consumed number.
+        $this->sequence++;
+    }
+
+    public function flush(): void
+    {
+        try {
+            $this->writer->flush();
         } catch (\Throwable $exception) {
             $this->handleFailure($exception);
         }
     }
 
-    private function formatTimestamp(\DateTimeImmutable $now): string
+    /**
+     * An empty name is API misuse and throws. Everything else is coerced rather than
+     * rejected: names are often built from request data ("webhook_{$type}"), and a
+     * fail-safe tracer must not turn a log-injection attempt into an application crash.
+     */
+    private function normalizeName(string $name): string
     {
-        $utc = $now->setTimezone(new \DateTimeZone('UTC'));
+        $name = trim($name);
 
-        return $utc->format('Y-m-d\TH:i:s.u\Z');
+        if ($name === '') {
+            throw new TracingException('Trace event name must not be empty.');
+        }
+
+        // \p{C} covers control characters, including the ESC that drives ANSI escape
+        // sequences. Event names get rendered straight into an operator's terminal.
+        $clean = preg_replace('/\p{C}+/u', '', $name);
+
+        if ($clean === null) {
+            // Subject was not valid UTF-8; json_encode() would reject the whole record.
+            $clean = self::INVALID_NAME;
+        }
+
+        $clean = trim($clean);
+
+        if ($clean === '') {
+            $clean = self::INVALID_NAME;
+        }
+
+        if (strlen($clean) > self::MAX_NAME_LENGTH) {
+            $clean = rtrim(Utf8::truncate($clean, self::MAX_NAME_LENGTH));
+        }
+
+        return $clean;
     }
 
     private function handleFailure(\Throwable $exception): void

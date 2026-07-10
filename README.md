@@ -15,9 +15,9 @@ composer require golovanov/traceloom
 ## Quick Start
 
 ```php
-use Golovanov\Tracer;
+use Golovanov\Traceloom\Tracer;
 
-$tracer = Tracer::create(logDirectory: __DIR__ . '/logs');
+$tracer = Tracer::fromDirectory(__DIR__ . '/logs');
 
 $trace = $tracer->start();
 
@@ -54,6 +54,10 @@ $trace->event('webhook_received');
 
 Invalid incoming IDs are replaced with a generated ID. Generated IDs are 32-character random hex strings.
 
+By default an incoming ID is trusted and reused, which keeps one ID across a service
+boundary. On a public endpoint, where the ID comes straight from a client, treat it as
+untrusted (see [Trusting Incoming Trace IDs](#trusting-incoming-trace-ids)).
+
 ## Finding A Trace
 
 After installing Traceloom as a dependency, Composer exposes the bundled CLI through `vendor/bin`:
@@ -83,22 +87,33 @@ The MVP CLI intentionally includes only `show`. More commands such as `tail` or 
 ## Configuration
 
 ```php
-use Golovanov\Configuration;
-use Golovanov\Tracer;
+use Golovanov\Traceloom\Configuration;
+use Golovanov\Traceloom\Tracer;
 
 $config = Configuration::create(
     logDirectory: __DIR__ . '/logs',
-    maxFileBytes: 50 * 1024 * 1024,
-    maxStringBytes: 64 * 1024,
+    maxFileBytes: 50 * 1024 * 1024,   // rotate a shard past this size
+    maxStringBytes: 64 * 1024,        // truncate longer strings (clamped to maxRecordBytes)
+    maxRecordBytes: 256 * 1024,       // degrade an event whose line exceeds this (clamped to maxFileBytes)
+    maxArrayItems: 1000,              // per-event budget on array entries
+    maxDepth: 16,                     // nesting beyond this becomes [MAX_DEPTH_EXCEEDED]
     sensitiveKeys: ['payment_token'],
+    strictSensitiveKeys: false,       // true => match whole keys only, no fragments
+    directoryMode: 0750,
+    fileMode: 0640,
+    retentionDays: 0,                 // >0 deletes shards older than the cutoff on rotation
+    trustIncomingTraceId: true,       // false quarantines inbound IDs as parent_trace_id
     failOnError: false,
     onError: static function (\Throwable $e): void {
         error_log($e->getMessage());
     },
 );
 
-$tracer = Tracer::create($config);
+$tracer = Tracer::fromConfiguration($config);
 ```
+
+`maxRecordBytes` is clamped to `maxFileBytes`, and `maxStringBytes` to `maxRecordBytes`,
+so a single event can never overflow a shard.
 
 Traceloom writes files by date and rotates into shards when the active file grows beyond `maxFileBytes`:
 
@@ -109,13 +124,31 @@ logs/
   2026-07-10-2.jsonl
 ```
 
-File selection and append are protected by a lock file in the log directory.
+The active file handle is reused across events; the directory lock is taken only when
+a shard has to be selected or rotated.
+
+## File Permissions
+
+Log directories are created `0750` and files `0640`, so they are not world-readable.
+Both are configurable via `directoryMode` and `fileMode`.
+
+Trace files hold request bodies, user identifiers, and (despite masking) potentially
+sensitive values. **Keep the log directory outside your web root** so it cannot be
+fetched over HTTP. Traceloom cannot enforce this for you.
 
 ## Sensitive Data
 
-Sensitive key masking is enabled by default and runs recursively. Built-in keys include:
+Sensitive key masking is enabled by default and runs recursively. Keys are compared
+after folding case and removing `-` and `_`, so `api_key`, `apiKey`, `API-KEY`, and
+`X-Api-Key` are all recognized. Built-in keys include `password`, `token`,
+`access_token`, `refresh_token`, `authorization`, `cookie`, `set_cookie`, `api_key`,
+`x_api_key`, `secret`, `client_secret`, `private_key`, `credentials`, `signature`,
+`session_id`, and `csrf`.
 
-`password`, `token`, `access_token`, `refresh_token`, `authorization`, `cookie`, `api_key`, `secret`, `client_secret`.
+By default a key is also masked if it *contains* a known secret fragment (`password`,
+`secret`, `token`, `apikey`, `privatekey`, `credential`), so `user_password` and
+`stripe_secret` are caught. Set `strictSensitiveKeys: true` to require a whole-key
+match instead.
 
 Masked values are written as:
 
@@ -125,9 +158,32 @@ Masked values are written as:
 
 Custom keys are merged with the defaults through `sensitiveKeys`.
 
+Masking is keyed on names, not values: a secret placed under an innocuous key (`note`,
+`body`) is not detected. Do not pass raw credentials under arbitrary keys.
+
+## Trusting Incoming Trace IDs
+
+By default an inbound trace ID is trusted and reused, which keeps a single ID across a
+service boundary. On a public endpoint the header is attacker-controlled, and a client
+that guesses or reuses another request's ID can write into that trace. Set
+`trustIncomingTraceId: false`:
+
+```php
+$tracer = Tracer::fromConfiguration(Configuration::create(
+    logDirectory: __DIR__ . '/logs',
+    trustIncomingTraceId: false,
+));
+
+$trace = $tracer->start($request->header('X-Trace-Id'));
+```
+
+The incoming value is then stored as `parent_trace_id` and a fresh ID is generated for
+the trace. Behind a trusted gateway that sets the header itself, leave the default.
+
 ## Payload Limits
 
-Long strings are replaced with explicit truncation metadata:
+Long strings are replaced with explicit truncation metadata (the preview is cut on a
+UTF-8 code-point boundary, never mid-character):
 
 ```json
 {
@@ -137,7 +193,22 @@ Long strings are replaced with explicit truncation metadata:
 }
 ```
 
-Supported payload values are arrays, strings, integers, floats, booleans, null, `JsonSerializable`, and `Stringable`. Unsupported values are replaced with an explicit marker.
+Supported payload values are arrays, strings, integers, floats, booleans, null, `JsonSerializable`, and `Stringable`.
+
+Other cases are replaced with an explicit marker rather than being allowed to break
+the write:
+
+| Marker | Cause |
+| --- | --- |
+| `{"_binary": true, ...}` | String is not valid UTF-8 (preview is hex) |
+| `[CIRCULAR_REFERENCE]` | Value refers back to itself |
+| `[MAX_DEPTH_EXCEEDED]` | Nesting deeper than `maxDepth` |
+| `[SERIALIZATION_FAILED: Class]` | A `jsonSerialize()`/`__toString()` threw |
+| `[UNSUPPORTED_TYPE: type]` | Value is a resource or other unsupported type |
+| `{"_omitted_items": N}` | Array entries beyond the `maxArrayItems` budget |
+
+If a whole event still cannot be encoded, its `data` is replaced with
+`{"_encoding_error": "..."}` so the event stays in the timeline instead of vanishing.
 
 ## HTTP Integration
 
@@ -146,6 +217,9 @@ For new integrations, prefer `X-Trace-Id`:
 ```php
 $trace = $tracer->start($request->header('X-Trace-Id'));
 ```
+
+On a public endpoint, configure `trustIncomingTraceId: false` first (see
+[Trusting Incoming Trace IDs](#trusting-incoming-trace-ids)).
 
 If your system already uses `X-Request-Id` for request correlation, it is fine to continue that trace:
 
@@ -176,7 +250,21 @@ Tracing is fail-safe by default: write errors should not break the main applicat
 
 Use `failOnError: true` when you want tracing failures to throw exceptions, usually in tests or strict local development.
 
-Configuration errors always throw.
+Configuration errors always throw. An empty event name always throws too — it is a
+programming error, not a runtime failure — regardless of `failOnError`.
+
+Even in fail-safe mode an event can be dropped (a full disk, a permission error). The
+count is available so you can surface it:
+
+```php
+if ($tracer->droppedEventCount() > 0) {
+    // tracing lost events; the timeline has holes
+}
+```
+
+`$tracer->flush()` forces buffered data to the OS; `$tracer->close()` releases the file
+handle. The handle is also flushed and closed automatically when the tracer is
+destroyed, so calling them is optional.
 
 ## When Not To Use Traceloom
 

@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use Golovanov\Tracer;
+use Golovanov\Traceloom\Tracer;
 
 $events = (int)($argv[1] ?? 10000);
 $payloadSize = (int)($argv[2] ?? 128);
 $directory = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'traceloom-benchmark-' . bin2hex(random_bytes(4));
 
-$tracer = Tracer::create(logDirectory: $directory);
+$tracer = Tracer::fromDirectory($directory);
 $trace = $tracer->start();
 $payload = ['body' => str_repeat('x', $payloadSize)];
 

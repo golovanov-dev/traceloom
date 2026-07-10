@@ -2,17 +2,24 @@
 
 declare(strict_types=1);
 
-namespace Golovanov\Clock;
+namespace Golovanov\Traceloom\Clock;
 
 final class SystemClock implements ClockInterface
 {
-    public function now(): \DateTimeImmutable
+    private readonly \DateTimeZone $utc;
+
+    public function __construct()
     {
-        return new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
+        $this->utc = new \DateTimeZone('UTC');
     }
 
-    public function microtime(): float
+    public function now(): \DateTimeImmutable
     {
-        return microtime(true);
+        return new \DateTimeImmutable('now', $this->utc);
+    }
+
+    public function monotonicNs(): int
+    {
+        return hrtime(true);
     }
 }

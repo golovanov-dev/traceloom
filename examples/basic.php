@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use Golovanov\Tracer;
+use Golovanov\Traceloom\Tracer;
 
-$tracer = Tracer::create(logDirectory: __DIR__ . '/../logs');
+$tracer = Tracer::fromDirectory(__DIR__ . '/../logs');
 
 $trace = $tracer->start();
 $trace->event('request_start', ['method' => 'POST', 'path' => '/orders']);
