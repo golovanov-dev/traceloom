@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 - Unreleased
+## 0.2.0 - 2026-07-10
 
 This release fixes three ways the tracer could break the host application or lose
 events silently, and rebuilds the write path. It is a `0.x` line, so breaking changes
@@ -65,7 +65,11 @@ are expected; the notable ones are listed under **Changed**.
   characters are stripped rather than rejected.
 - Added `retentionDays` for deleting shards older than the cutoff on rotation.
 
-### Added (from the initial MVP)
+## 0.1.0 - 2026-07-10
+
+Initial release.
+
+### Added
 
 - Trace-oriented public API with `Tracer` and `Trace`.
 - Local JSONL storage with per-date files and size-based shards.
