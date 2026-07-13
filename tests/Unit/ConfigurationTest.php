@@ -51,6 +51,17 @@ final class ConfigurationTest extends TestCase
         Configuration::create(logDirectory: 'logs', maxDepth: 0);
     }
 
+    /**
+     * Below the minimum the digest suffix would not fit, and truncated keys could
+     * collide again.
+     */
+    public function testRejectsMaxKeyBytesBelowTheDigestSuffix(): void
+    {
+        $this->expectException(ConfigurationException::class);
+
+        Configuration::create(logDirectory: 'logs', maxKeyBytes: Configuration::MIN_MAX_KEY_BYTES - 1);
+    }
+
     public function testRejectsNegativeRetention(): void
     {
         $this->expectException(ConfigurationException::class);

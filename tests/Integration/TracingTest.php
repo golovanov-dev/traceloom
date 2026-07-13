@@ -118,6 +118,35 @@ final class TracingTest extends TestCase
         self::assertSame(0, $tracer->droppedEventCount());
     }
 
+    /**
+     * U+2028/U+2029 are line terminators to some consumers but not to `\n`-splitting
+     * ones, so a raw one in a record would let a payload forge a second JSONL line.
+     * PHP's json_encode escapes them even under JSON_UNESCAPED_UNICODE — this locks
+     * that in, because the format guarantee must not rest on an unstated default.
+     */
+    public function testUnicodeLineSeparatorsCannotBreakARecordInTwo(): void
+    {
+        $this->tempDirectory = TempDirectory::create('traceloom');
+        $tracer = Tracer::fromConfiguration(Configuration::create(
+            logDirectory: $this->tempDirectory,
+            failOnError: true,
+        ));
+
+        $tracer->start('u2028')->event('sep', ['text' => "before\u{2028}middle\u{2029}after"]);
+        $tracer->close();
+
+        $raw = (string)file_get_contents($this->logFiles($this->tempDirectory)[0]);
+
+        self::assertStringNotContainsString("\u{2028}", $raw, 'must be escaped, not raw');
+        self::assertStringNotContainsString("\u{2029}", $raw);
+        self::assertCount(1, $this->readLines($this->tempDirectory), 'one event is one line');
+        self::assertSame(
+            "before\u{2028}middle\u{2029}after",
+            $this->readEvents($this->tempDirectory)[0]['data']['text'],
+            'the payload still round-trips',
+        );
+    }
+
     public function testBinaryPayloadDoesNotDropTheEvent(): void
     {
         $this->tempDirectory = TempDirectory::create('traceloom');

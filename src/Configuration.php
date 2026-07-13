@@ -13,7 +13,14 @@ final class Configuration
     public const DEFAULT_MAX_RECORD_BYTES = 256 * 1024;
     public const DEFAULT_MAX_ARRAY_ITEMS = 1000;
     public const DEFAULT_MAX_PAYLOAD_NODES = 10000;
+    public const DEFAULT_MAX_KEY_BYTES = 256;
     public const DEFAULT_MAX_DEPTH = 16;
+
+    /**
+     * A truncated key carries a 17-byte digest suffix, so anything below this leaves
+     * no room for the key itself.
+     */
+    public const MIN_MAX_KEY_BYTES = 32;
     public const DEFAULT_DIRECTORY_MODE = 0750;
     public const DEFAULT_FILE_MODE = 0640;
 
@@ -89,6 +96,7 @@ final class Configuration
         public readonly int $maxRecordBytes,
         public readonly int $maxArrayItems,
         public readonly int $maxPayloadNodes,
+        public readonly int $maxKeyBytes,
         public readonly int $maxDepth,
         public readonly array $sensitiveKeyMap,
         public readonly bool $strictSensitiveKeys,
@@ -111,6 +119,7 @@ final class Configuration
         int $maxRecordBytes = self::DEFAULT_MAX_RECORD_BYTES,
         int $maxArrayItems = self::DEFAULT_MAX_ARRAY_ITEMS,
         int $maxPayloadNodes = self::DEFAULT_MAX_PAYLOAD_NODES,
+        int $maxKeyBytes = self::DEFAULT_MAX_KEY_BYTES,
         int $maxDepth = self::DEFAULT_MAX_DEPTH,
         array $sensitiveKeys = [],
         bool $strictSensitiveKeys = false,
@@ -130,6 +139,13 @@ final class Configuration
         self::assertPositive($maxPayloadNodes, 'Max payload nodes');
         self::assertPositive($maxDepth, 'Max depth');
 
+        if ($maxKeyBytes < self::MIN_MAX_KEY_BYTES) {
+            throw new ConfigurationException(
+                'Max key size must be at least ' . self::MIN_MAX_KEY_BYTES
+                . ' bytes to leave room for the collision-avoiding digest.',
+            );
+        }
+
         if ($retentionDays < 0) {
             throw new ConfigurationException('Retention days must not be negative.');
         }
@@ -148,6 +164,7 @@ final class Configuration
             maxRecordBytes: $maxRecordBytes,
             maxArrayItems: $maxArrayItems,
             maxPayloadNodes: $maxPayloadNodes,
+            maxKeyBytes: $maxKeyBytes,
             maxDepth: $maxDepth,
             sensitiveKeyMap: self::buildSensitiveKeyMap([...self::DEFAULT_SENSITIVE_KEYS, ...$sensitiveKeys]),
             strictSensitiveKeys: $strictSensitiveKeys,

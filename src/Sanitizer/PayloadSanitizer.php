@@ -22,6 +22,9 @@ final class PayloadSanitizer
      */
     private const RESERVED_KEY_PATTERN = '/^_+(binary|truncated|encoding_error|omitted_items)$/D';
 
+    /** Separator plus 16 hex characters of digest. */
+    private const KEY_DIGEST_SUFFIX_BYTES = 17;
+
     /** @var array<string, string> */
     private array $keyCache = [];
 
@@ -43,6 +46,7 @@ final class PayloadSanitizer
         private readonly int $maxStringBytes,
         private readonly int $maxArrayItems,
         private readonly int $maxPayloadNodes,
+        private readonly int $maxKeyBytes,
         private readonly int $maxDepth,
         private readonly array $sensitiveKeyMap,
         private readonly bool $strictSensitiveKeys = false,
@@ -56,6 +60,7 @@ final class PayloadSanitizer
             maxStringBytes: $configuration->maxStringBytes,
             maxArrayItems: $configuration->maxArrayItems,
             maxPayloadNodes: $configuration->maxPayloadNodes,
+            maxKeyBytes: $configuration->maxKeyBytes,
             maxDepth: $configuration->maxDepth,
             sensitiveKeyMap: $configuration->sensitiveKeyMap,
             strictSensitiveKeys: $configuration->strictSensitiveKeys,
@@ -112,12 +117,17 @@ final class PayloadSanitizer
             $remaining--;
             $this->budget--;
 
-            if ($this->isSensitiveKey($key)) {
-                $this->assign($normalized, $key, Configuration::REDACTED);
+            // Sensitivity is decided on the ORIGINAL key: truncation must never be a
+            // way to smuggle a secret past the mask.
+            $sensitive = $this->isSensitiveKey($key);
+            $outKey = $this->normalizeKey($key);
+
+            if ($sensitive) {
+                $this->assign($normalized, $outKey, Configuration::REDACTED);
                 continue;
             }
 
-            $this->assign($normalized, $key, $this->normalizeValue($value, $depth + 1, $seen));
+            $this->assign($normalized, $outKey, $this->normalizeValue($value, $depth + 1, $seen));
         }
 
         if ($omitted > 0) {
@@ -155,6 +165,33 @@ final class PayloadSanitizer
         }
 
         return $normalized;
+    }
+
+    /**
+     * Bounds an over-long key.
+     *
+     * Keys were the one unbounded dimension left in the sanitizer: a single 200 KB key
+     * could push a record past maxRecordBytes and degrade the entire payload to an
+     * `_encoding_error`, so one hostile field destroyed every other field of the event.
+     * Keys arrive from exactly where values do — external JSON — so they need the same
+     * bound.
+     *
+     * Naive truncation would collide: two keys sharing a long prefix would collapse
+     * into one and silently overwrite each other's value. The suffix is a digest of the
+     * WHOLE original key, which keeps distinct keys distinct. The result is still an
+     * ordinary string key, so no JSONL consumer has to change, and the mapping is
+     * deterministic across processes, runs and the PHP/JS/Go implementations alike.
+     */
+    private function normalizeKey(int|string $key): int|string
+    {
+        if (!is_string($key) || strlen($key) <= $this->maxKeyBytes) {
+            return $key;
+        }
+
+        $digest = substr(hash('sha256', $key), 0, 16);
+        $head = Utf8::truncate($key, $this->maxKeyBytes - self::KEY_DIGEST_SUFFIX_BYTES);
+
+        return $head . '~' . $digest;
     }
 
     /**

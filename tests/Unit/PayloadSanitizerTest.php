@@ -101,6 +101,73 @@ final class PayloadSanitizerTest extends TestCase
         self::assertSame(['author' => 'a', 'keyboard' => 'b', 'monkey' => 'c', 'username' => 'd', 'email' => 'e'], $payload);
     }
 
+    /**
+     * Keys were the last unbounded dimension: one 200 KB key pushed the record past
+     * maxRecordBytes and degraded the whole payload, so a single hostile field
+     * destroyed every other field of the event.
+     */
+    public function testTruncatesOverlongKeys(): void
+    {
+        $key = str_repeat('K', 5000);
+        $payload = self::sanitizer(maxKeyBytes: 64)->sanitize([$key => 'value']);
+
+        $written = (string)array_key_first($payload);
+
+        self::assertSame(64, strlen($written));
+        self::assertSame('value', $payload[$written]);
+        self::assertMatchesRegularExpression('/~[0-9a-f]{16}$/D', $written);
+    }
+
+    /**
+     * The digest is taken over the WHOLE original key, so keys sharing a long prefix
+     * stay distinct. Naive truncation would collapse them into one and silently
+     * overwrite a value — the objection that kept this feature on the shelf.
+     */
+    public function testTruncatedKeysWithACommonPrefixDoNotCollide(): void
+    {
+        $prefix = str_repeat('P', 400);
+        $payload = self::sanitizer()->sanitize([
+            $prefix . 'alpha' => 1,
+            $prefix . 'beta' => 2,
+        ]);
+
+        self::assertCount(2, $payload, 'distinct keys must survive truncation as distinct');
+        self::assertSame([1, 2], array_values($payload));
+    }
+
+    public function testKeyTruncationIsDeterministic(): void
+    {
+        $key = str_repeat('D', 900);
+
+        $first = self::sanitizer()->sanitize([$key => 1]);
+        $second = self::sanitizer()->sanitize([$key => 1]);
+
+        self::assertSame(array_key_first($first), array_key_first($second));
+    }
+
+    public function testKeyTruncationCutsOnACodePointBoundary(): void
+    {
+        $key = str_repeat('ключ', 200);
+        $payload = self::sanitizer(maxKeyBytes: 64)->sanitize([$key => 1]);
+
+        $written = (string)array_key_first($payload);
+
+        self::assertLessThanOrEqual(64, strlen($written));
+        self::assertSame(1, preg_match('//u', $written), 'a split code point would break json_encode');
+        self::assertNotFalse(json_encode($payload, JSON_THROW_ON_ERROR));
+    }
+
+    /**
+     * Truncation must not become a way to smuggle a secret past the mask.
+     */
+    public function testSensitivityIsDecidedOnTheOriginalKey(): void
+    {
+        $key = 'password_' . str_repeat('x', 5000);
+        $payload = self::sanitizer(maxKeyBytes: 32)->sanitize([$key => 'hunter2']);
+
+        self::assertSame(['[REDACTED]'], array_values($payload));
+    }
+
     public function testStrictModeMatchesWholeKeysOnly(): void
     {
         $lenient = self::sanitizer()->sanitize(['token_count' => 7]);

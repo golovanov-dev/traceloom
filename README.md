@@ -97,6 +97,7 @@ $config = Configuration::create(
     maxRecordBytes: 256 * 1024,       // degrade an event whose line exceeds this (clamped to maxFileBytes)
     maxArrayItems: 1000,              // limit on EACH array, on its own
     maxPayloadNodes: 10000,           // node budget for the payload as a whole
+    maxKeyBytes: 256,                 // longer keys are truncated with a digest (min 32)
     maxDepth: 16,                     // nesting beyond this becomes [MAX_DEPTH_EXCEEDED]
     sensitiveKeys: ['payment_token'],
     strictSensitiveKeys: false,       // true => match whole keys only, no fragments
@@ -216,6 +217,18 @@ the write:
 Two independent limits bound a payload. `maxArrayItems` caps **each array on its own**,
 so one long list cannot push its sibling fields out of the event; `maxPayloadNodes` caps
 the payload **as a whole**, which is what stops a wide or deeply nested input bomb.
+
+Keys are bounded too. A key longer than `maxKeyBytes` is cut on a code-point boundary
+and given a digest of the **original** key, so that keys sharing a long prefix stay
+distinct instead of collapsing into one and overwriting each other:
+
+```text
+"very_long_key_from_untrusted_json…"  →  "very_long_key_fro…~3f2a9c1e5b7d4088"
+```
+
+The result is an ordinary string key — no JSONL consumer has to change — and the mapping
+is deterministic across processes, runs, and the PHP, JS and Go implementations alike.
+Masking is decided on the original key, so truncation cannot smuggle a secret past it.
 
 If a whole event still cannot be encoded, its `data` is replaced with
 `{"_encoding_error": "..."}` so the event stays in the timeline instead of vanishing.

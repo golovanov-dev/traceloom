@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 - 2026-07-13
+
+### Added
+
+- `maxKeyBytes` (default 256, minimum 32): payload keys longer than this are cut on a
+  code-point boundary and given a digest of the original key, e.g.
+  `very_long_key_fro…~3f2a9c1e5b7d4088`. Keys were the one unbounded dimension left in
+  the sanitizer: a single 200 KB key could push a record past `maxRecordBytes` and
+  degrade the whole payload to `_encoding_error`, so one hostile field destroyed every
+  other field of the event. The digest covers the *original* key, so keys sharing a
+  long prefix stay distinct rather than collapsing into one and silently overwriting
+  each other. Masking is still decided on the original key. The scheme is shared with
+  the JS and Go implementations.
+
 ## 0.3.0 - 2026-07-13
 
 Aligns the JSONL contract with the Node.js and Go implementations, which had moved
