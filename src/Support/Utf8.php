@@ -18,6 +18,27 @@ final class Utf8
     }
 
     /**
+     * Decodes the code point of a single, valid UTF-8 character.
+     *
+     * Exists so the package stays free of ext-mbstring (mb_ord) for what is a
+     * handful of bit operations.
+     */
+    public static function ord(string $character): int
+    {
+        $bytes = array_map('ord', str_split($character));
+        $length = count($bytes);
+
+        return match ($length) {
+            1 => $bytes[0],
+            2 => (($bytes[0] & 0x1F) << 6) | ($bytes[1] & 0x3F),
+            3 => (($bytes[0] & 0x0F) << 12) | (($bytes[1] & 0x3F) << 6) | ($bytes[2] & 0x3F),
+            4 => (($bytes[0] & 0x07) << 18) | (($bytes[1] & 0x3F) << 12)
+                | (($bytes[2] & 0x3F) << 6) | ($bytes[3] & 0x3F),
+            default => 0xFFFD,
+        };
+    }
+
+    /**
      * Cuts $value to at most $maxBytes without splitting a multi-byte code point.
      *
      * Splitting one is not a cosmetic problem: the result is invalid UTF-8, and

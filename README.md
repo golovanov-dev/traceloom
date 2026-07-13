@@ -54,9 +54,9 @@ $trace->event('webhook_received');
 
 Invalid incoming IDs are replaced with a generated ID. Generated IDs are 32-character random hex strings.
 
-By default an incoming ID is trusted and reused, which keeps one ID across a service
-boundary. On a public endpoint, where the ID comes straight from a client, treat it as
-untrusted (see [Trusting Incoming Trace IDs](#trusting-incoming-trace-ids)).
+An incoming ID is **not** trusted by default: it is recorded as `parent_trace_id` and a
+fresh ID is generated. Behind a gateway that sets the header itself, opt in to reusing
+it (see [Trusting Incoming Trace IDs](#trusting-incoming-trace-ids)).
 
 ## Finding A Trace
 
@@ -95,14 +95,15 @@ $config = Configuration::create(
     maxFileBytes: 50 * 1024 * 1024,   // rotate a shard past this size
     maxStringBytes: 64 * 1024,        // truncate longer strings (clamped to maxRecordBytes)
     maxRecordBytes: 256 * 1024,       // degrade an event whose line exceeds this (clamped to maxFileBytes)
-    maxArrayItems: 1000,              // per-event budget on array entries
+    maxArrayItems: 1000,              // limit on EACH array, on its own
+    maxPayloadNodes: 10000,           // node budget for the payload as a whole
     maxDepth: 16,                     // nesting beyond this becomes [MAX_DEPTH_EXCEEDED]
     sensitiveKeys: ['payment_token'],
     strictSensitiveKeys: false,       // true => match whole keys only, no fragments
     directoryMode: 0750,
     fileMode: 0640,
     retentionDays: 0,                 // >0 deletes shards older than the cutoff on rotation
-    trustIncomingTraceId: true,       // false quarantines inbound IDs as parent_trace_id
+    trustIncomingTraceId: false,      // true reuses an inbound ID instead of quarantining it
     failOnError: false,
     onError: static function (\Throwable $e): void {
         error_log($e->getMessage());
@@ -163,22 +164,27 @@ Masking is keyed on names, not values: a secret placed under an innocuous key (`
 
 ## Trusting Incoming Trace IDs
 
-By default an inbound trace ID is trusted and reused, which keeps a single ID across a
-service boundary. On a public endpoint the header is attacker-controlled, and a client
-that guesses or reuses another request's ID can write into that trace. Set
-`trustIncomingTraceId: false`:
+An inbound trace ID is **not trusted by default**. On a public endpoint the header is
+attacker-controlled, and a client that guesses or replays another request's ID could
+otherwise write its own events into that trace and corrupt an investigation. The
+incoming value is stored as `parent_trace_id`, and a fresh ID is generated:
+
+```php
+$trace = $tracer->start($request->header('X-Trace-Id'));
+
+$trace->id();        // freshly generated
+$trace->parentId();  // the value the client sent
+```
+
+Behind a gateway or service mesh that sets the header itself, opt in to reusing it so a
+single ID spans the whole call chain:
 
 ```php
 $tracer = Tracer::fromConfiguration(Configuration::create(
     logDirectory: __DIR__ . '/logs',
-    trustIncomingTraceId: false,
+    trustIncomingTraceId: true,
 ));
-
-$trace = $tracer->start($request->header('X-Trace-Id'));
 ```
-
-The incoming value is then stored as `parent_trace_id` and a fresh ID is generated for
-the trace. Behind a trusted gateway that sets the header itself, leave the default.
 
 ## Payload Limits
 
@@ -205,10 +211,23 @@ the write:
 | `[MAX_DEPTH_EXCEEDED]` | Nesting deeper than `maxDepth` |
 | `[SERIALIZATION_FAILED: Class]` | A `jsonSerialize()`/`__toString()` threw |
 | `[UNSUPPORTED_TYPE: type]` | Value is a resource or other unsupported type |
-| `{"_omitted_items": N}` | Array entries beyond the `maxArrayItems` budget |
+| `{"_omitted_items": N}` | Entries dropped past `maxArrayItems` or `maxPayloadNodes` |
+
+Two independent limits bound a payload. `maxArrayItems` caps **each array on its own**,
+so one long list cannot push its sibling fields out of the event; `maxPayloadNodes` caps
+the payload **as a whole**, which is what stops a wide or deeply nested input bomb.
 
 If a whole event still cannot be encoded, its `data` is replaced with
 `{"_encoding_error": "..."}` so the event stays in the timeline instead of vanishing.
+That is a real loss of data, so it is counted — see [Error Handling](#error-handling).
+
+### Reserved Keys
+
+`_truncated`, `_binary`, `_encoding_error` and `_omitted_items` belong to the
+sanitizer. A payload key that spells one of them gains a leading underscore
+(`_truncated` → `__truncated`), so a record cannot claim to be sanitizer output when it
+is not, and a genuine marker can never overwrite a field of yours. The escape is itself
+escaped, so the mapping back is unambiguous.
 
 ## HTTP Integration
 
@@ -218,7 +237,7 @@ For new integrations, prefer `X-Trace-Id`:
 $trace = $tracer->start($request->header('X-Trace-Id'));
 ```
 
-On a public endpoint, configure `trustIncomingTraceId: false` first (see
+The header is quarantined as `parent_trace_id` unless you opt in (see
 [Trusting Incoming Trace IDs](#trusting-incoming-trace-ids)).
 
 If your system already uses `X-Request-Id` for request correlation, it is fine to continue that trace:
@@ -253,18 +272,28 @@ Use `failOnError: true` when you want tracing failures to throw exceptions, usua
 Configuration errors always throw. An empty event name always throws too — it is a
 programming error, not a runtime failure — regardless of `failOnError`.
 
-Even in fail-safe mode an event can be dropped (a full disk, a permission error). The
-count is available so you can surface it:
+Even in fail-safe mode data can be lost, in two different ways, and neither is silent:
 
 ```php
-if ($tracer->droppedEventCount() > 0) {
-    // tracing lost events; the timeline has holes
-}
+$tracer->droppedEventCount();    // the event never reached the log
+$tracer->degradedEventCount();   // the event was written, its payload was not
 ```
 
-`$tracer->flush()` forces buffered data to the OS; `$tracer->close()` releases the file
-handle. The handle is also flushed and closed automatically when the tracer is
-destroyed, so calling them is optional.
+An event is **dropped** when the write fails (a full disk, a permission error). It is
+**degraded** when its payload could not be encoded or exceeded `maxRecordBytes`: the
+record survives with `data` replaced by `{"_encoding_error": "..."}`, because an event
+with a placeholder is worth more than a hole in the timeline. Both cases also reach
+`onError`.
+
+A dropped event leaves a **gap in `sequence`**. That gap is deliberate: the counters
+above live in the process's memory and die with it, while the log file outlives both,
+so the gap is the only signal to whoever reads the JSONL later that the timeline is
+incomplete.
+
+`$tracer->flush()` forces buffered data to the OS. `$tracer->close()` is **terminal**:
+it releases the file handle, and events recorded afterwards are rejected and counted as
+dropped rather than silently reopening the file. The handle is also flushed and closed
+when the tracer is destroyed, so calling either is optional.
 
 ## When Not To Use Traceloom
 

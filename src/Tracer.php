@@ -19,9 +19,10 @@ final class Tracer
         private readonly Configuration $configuration,
         private readonly WriterInterface $writer,
         private readonly ClockInterface $clock,
+        ?Metrics $metrics = null,
     ) {
         $this->sanitizer = PayloadSanitizer::fromConfiguration($configuration);
-        $this->metrics = new Metrics();
+        $this->metrics = $metrics ?? new Metrics();
     }
 
     /**
@@ -34,21 +35,26 @@ final class Tracer
 
     public static function fromConfiguration(Configuration $configuration): self
     {
+        // One Metrics instance is shared with the writer, which is the only place that
+        // can see a payload degrade.
+        $metrics = new Metrics();
+
         return new self(
             configuration: $configuration,
-            writer: new JsonlFileWriter($configuration),
+            writer: new JsonlFileWriter($configuration, $metrics),
             clock: new SystemClock(),
+            metrics: $metrics,
         );
     }
 
     /**
      * Starts a trace.
      *
-     * $traceId is trusted by default, because the caller decided to pass it.
-     * When it originates from an untrusted source (an inbound HTTP header on a
-     * public endpoint), set Configuration::$trustIncomingTraceId to false: the
-     * incoming value is then recorded as `parent_trace_id` and a fresh ID is
-     * generated, so a client cannot write into someone else's trace.
+     * An incoming $traceId is NOT trusted by default: it is recorded as
+     * `parent_trace_id` and a fresh ID is generated, so a client that guesses or
+     * replays another request's ID cannot write into that trace. Behind a gateway
+     * that sets the header itself, set Configuration::$trustIncomingTraceId to true
+     * to carry a single ID across the service boundary.
      */
     public function start(?string $traceId = null): Trace
     {
@@ -74,12 +80,22 @@ final class Tracer
     }
 
     /**
-     * Number of events this tracer failed to persist. Non-zero means the timeline
-     * has holes; with failOnError disabled this is the only signal you get.
+     * Events that never reached the log. Non-zero means the timeline has holes; with
+     * failOnError disabled this and the gaps in `sequence` are the only signals.
      */
     public function droppedEventCount(): int
     {
         return $this->metrics->droppedEvents();
+    }
+
+    /**
+     * Events that were recorded, but whose payload was replaced by an
+     * `_encoding_error` marker (too large, or not encodable). The event survives, the
+     * data does not.
+     */
+    public function degradedEventCount(): int
+    {
+        return $this->metrics->degradedEvents();
     }
 
     public function flush(): void
@@ -87,6 +103,9 @@ final class Tracer
         $this->writer->flush();
     }
 
+    /**
+     * Terminal: events recorded afterwards are rejected and counted as dropped.
+     */
     public function close(): void
     {
         $this->writer->close();

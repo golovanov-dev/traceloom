@@ -6,6 +6,7 @@ namespace Golovanov\Traceloom\Writer;
 
 use Golovanov\Traceloom\Configuration;
 use Golovanov\Traceloom\Exception\TracingException;
+use Golovanov\Traceloom\Metrics;
 use Golovanov\Traceloom\TraceEvent;
 
 /**
@@ -43,10 +44,16 @@ final class JsonlFileWriter implements WriterInterface
     private int $currentIndex = 0;
     private int $currentSize = 0;
     private int $writesSinceResync = 0;
-    private bool $retentionApplied = false;
+    private ?string $retentionDate = null;
+    private bool $closed = false;
 
-    public function __construct(private readonly Configuration $configuration)
-    {
+    private readonly Metrics $metrics;
+
+    public function __construct(
+        private readonly Configuration $configuration,
+        ?Metrics $metrics = null,
+    ) {
+        $this->metrics = $metrics ?? new Metrics();
     }
 
     public function __destruct()
@@ -56,6 +63,13 @@ final class JsonlFileWriter implements WriterInterface
 
     public function write(TraceEvent $event): void
     {
+        // close() is terminal. Reopening the file for a late event would make shutdown
+        // non-deterministic and leak the handle, and the write would look successful
+        // to a caller that has already stopped tracing.
+        if ($this->closed) {
+            throw new TracingException('Writer is closed; the event was not recorded.');
+        }
+
         $line = $this->encodeLine($event);
         $bytes = strlen($line);
         $date = $event->utcDate();
@@ -101,6 +115,16 @@ final class JsonlFileWriter implements WriterInterface
     }
 
     public function close(): void
+    {
+        $this->closed = true;
+        $this->closeHandle();
+    }
+
+    /**
+     * Releases the handle without ending the writer's life, so rotation can reopen
+     * on a different shard. close() is the terminal operation; this is not.
+     */
+    private function closeHandle(): void
     {
         if ($this->handle === null) {
             return;
@@ -169,7 +193,7 @@ final class JsonlFileWriter implements WriterInterface
             }
 
             $previousDate = $this->currentDate;
-            $this->close();
+            $this->closeHandle();
 
             // Same day: keep scanning from the shard we already know about.
             // New day: locate the highest existing shard once.
@@ -192,7 +216,7 @@ final class JsonlFileWriter implements WriterInterface
             $this->currentSize = $size;
             $this->writesSinceResync = 0;
 
-            $this->applyRetention($directory);
+            $this->applyRetention($directory, $date);
         } finally {
             flock($lock, LOCK_UN);
             fclose($lock);
@@ -255,35 +279,50 @@ final class JsonlFileWriter implements WriterInterface
     }
 
     /**
-     * Runs once per process, on the first rotation, while the lock is held.
+     * Runs once per UTC date, while the lock is held, so a long-lived process keeps
+     * expiring old shards instead of doing it once at startup and never again.
      */
-    private function applyRetention(string $directory): void
+    private function applyRetention(string $directory, string $date): void
     {
         $days = $this->configuration->retentionDays;
 
-        if ($days === 0 || $this->retentionApplied) {
+        if ($days === 0 || $this->retentionDate === $date) {
             return;
         }
 
-        $this->retentionApplied = true;
+        $this->retentionDate = $date;
 
-        $cutoff = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))
+        $cutoff = (new \DateTimeImmutable($date . ' 00:00:00', new \DateTimeZone('UTC')))
             ->modify('-' . $days . ' days')
             ->format('Y-m-d');
 
-        $files = glob($directory . DIRECTORY_SEPARATOR . '*.jsonl');
+        $entries = @scandir($directory);
 
-        if ($files === false) {
+        if ($entries === false) {
             return;
         }
 
-        foreach ($files as $file) {
-            $date = substr(basename($file), 0, 10);
+        foreach ($entries as $entry) {
+            $shardDate = self::shardDate($entry);
 
-            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) === 1 && $date < $cutoff) {
-                @unlink($file);
+            // Only files this library produced. A date-prefix match would also delete
+            // things like "2024-01-01-backup.jsonl" that someone else put here.
+            if ($shardDate !== null && $shardDate < $cutoff) {
+                @unlink($directory . DIRECTORY_SEPARATOR . $entry);
             }
         }
+    }
+
+    /**
+     * @return string|null The shard's date, or null if the name is not ours.
+     */
+    private static function shardDate(string $entry): ?string
+    {
+        if (preg_match('/^(\d{4}-\d{2}-\d{2})(?:-\d+)?\.jsonl$/D', $entry, $matches) !== 1) {
+            return null;
+        }
+
+        return $matches[1];
     }
 
     private function encodeLine(TraceEvent $event): string
@@ -294,17 +333,42 @@ final class JsonlFileWriter implements WriterInterface
             // The payload could not be encoded. The event itself still happened,
             // and a timeline with a placeholder beats a hole in the timeline.
             $json = $this->encode($event->toDegradedArray($exception->getMessage()));
+            $this->reportDegraded($event, $exception->getMessage());
         }
 
         $maxRecordBytes = $this->configuration->maxRecordBytes;
 
         if (strlen($json) + 1 > $maxRecordBytes) {
-            $json = $this->encode($event->toDegradedArray(
-                'record_too_large: ' . (strlen($json) + 1) . ' bytes exceeds ' . $maxRecordBytes,
-            ));
+            $reason = 'record_too_large: ' . (strlen($json) + 1) . ' bytes exceeds ' . $maxRecordBytes;
+            $json = $this->encode($event->toDegradedArray($reason));
+            $this->reportDegraded($event, $reason);
         }
 
         return $json . "\n";
+    }
+
+    /**
+     * The event survives, its payload does not — that loss must not be silent.
+     * Without this, an application whose events all exceed maxRecordBytes would see
+     * droppedEventCount() == 0 and conclude tracing was healthy.
+     */
+    private function reportDegraded(TraceEvent $event, string $reason): void
+    {
+        $this->metrics->recordDegradedEvent();
+
+        $onError = $this->configuration->onError;
+
+        if ($onError === null) {
+            return;
+        }
+
+        try {
+            $onError(new TracingException(
+                'Payload of trace event "' . $event->name . '" was discarded: ' . $reason,
+            ));
+        } catch (\Throwable) {
+            // An observability callback must never break the host application.
+        }
     }
 
     /**
@@ -385,6 +449,15 @@ final class JsonlFileWriter implements WriterInterface
             $written = fwrite($handle, substr($line, $offset));
 
             if ($written === false || $written === 0) {
+                // A short write (a disk filling up mid-line) leaves a fragment with no
+                // terminating newline. The next event would then be appended straight
+                // onto it, corrupting a second record on top of the one already lost.
+                // Restore the line boundary; the failure is still reported.
+                if ($offset > 0) {
+                    @fwrite($handle, "\n");
+                    @fflush($handle);
+                }
+
                 throw new TracingException('Unable to write log file: ' . $path);
             }
 

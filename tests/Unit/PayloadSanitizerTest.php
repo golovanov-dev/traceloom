@@ -56,6 +56,51 @@ final class PayloadSanitizerTest extends TestCase
         self::assertSame('kept', $payload['username']);
     }
 
+    /**
+     * Regression: the fragment list held only password/secret/token/apikey/..., so the
+     * spellings that actually show up when dumping HTTP headers went to disk in clear
+     * text. Ten of these twelve leaked. The list must stay identical across PHP, JS
+     * and Go, or the same payload gets masked differently depending on who wrote it.
+     */
+    public function testMasksRealWorldHeaderSpellings(): void
+    {
+        $keys = [
+            'cookies',
+            'Cookie-Header',
+            'authorization_header',
+            'Authorization-Bearer',
+            'bearer',
+            'jwt',
+            'jwt_value',
+            'session',
+            'auth',
+            'api_key',
+            'access_key',
+            'password',
+        ];
+
+        $payload = self::sanitizer()->sanitize(array_fill_keys($keys, 'SECRET'));
+        $leaked = array_keys(array_filter($payload, static fn (mixed $v): bool => $v === 'SECRET'));
+
+        self::assertSame([], $leaked, 'these must never reach the log in clear text');
+    }
+
+    /**
+     * The fragment list must not be so eager that it redacts ordinary fields.
+     */
+    public function testDoesNotRedactInnocentKeys(): void
+    {
+        $payload = self::sanitizer()->sanitize([
+            'author' => 'a',
+            'keyboard' => 'b',
+            'monkey' => 'c',
+            'username' => 'd',
+            'email' => 'e',
+        ]);
+
+        self::assertSame(['author' => 'a', 'keyboard' => 'b', 'monkey' => 'c', 'username' => 'd', 'email' => 'e'], $payload);
+    }
+
     public function testStrictModeMatchesWholeKeysOnly(): void
     {
         $lenient = self::sanitizer()->sanitize(['token_count' => 7]);
@@ -207,9 +252,27 @@ final class PayloadSanitizerTest extends TestCase
         self::assertNotFalse(json_encode($payload, JSON_THROW_ON_ERROR));
     }
 
-    public function testBudgetsArrayItemsAcrossTheWholePayload(): void
+    /**
+     * Regression: maxArrayItems used to be a single budget for the whole payload, so
+     * one long list swallowed its sibling fields — `zz_id` disappeared because of an
+     * array in `aa_items`. JS and Go split the two limits; this keeps PHP aligned.
+     */
+    public function testMaxArrayItemsLimitsEachArraySeparately(): void
     {
-        $payload = self::sanitizer(maxArrayItems: 3)->sanitize([
+        $payload = self::sanitizer(maxArrayItems: 4)->sanitize([
+            'first' => [1, 2, 3, 4, 5, 6],
+            'second' => [1, 2, 3, 4, 5, 6],
+            'user_id' => 42,
+        ]);
+
+        self::assertSame(42, $payload['user_id'], 'a long list must not swallow its siblings');
+        self::assertSame([1, 2, 3, 4, ['_omitted_items' => 2]], $payload['first']);
+        self::assertSame([1, 2, 3, 4, ['_omitted_items' => 2]], $payload['second']);
+    }
+
+    public function testMaxPayloadNodesBoundsTheWholePayload(): void
+    {
+        $payload = self::sanitizer(maxPayloadNodes: 3)->sanitize([
             'a' => 1,
             'b' => 2,
             'c' => 3,
@@ -217,8 +280,50 @@ final class PayloadSanitizerTest extends TestCase
             'e' => 5,
         ]);
 
-        self::assertSame(2, $payload['_omitted_items']);
+        self::assertSame(2, $payload['_omitted_items'], 'counts every entry left unvisited');
         self::assertArrayNotHasKey('d', $payload);
+        self::assertArrayNotHasKey('e', $payload);
+    }
+
+    /**
+     * A payload must not be able to spell a marker the sanitizer writes: it would be
+     * indistinguishable from a real one, which both misreports and forges the log.
+     */
+    public function testEscapesPayloadKeysThatSpellReservedMarkers(): void
+    {
+        $payload = self::sanitizer()->sanitize([
+            '_encoding_error' => 'FAKE',
+            '_truncated' => true,
+            '_binary' => 'x',
+            '_omitted_items' => 99,
+            '__truncated' => 'already escaped',
+        ]);
+
+        // Each reserved spelling gains one underscore...
+        self::assertSame('FAKE', $payload['__encoding_error']);
+        self::assertTrue($payload['__truncated']);
+        self::assertSame('x', $payload['__binary']);
+        self::assertSame(99, $payload['__omitted_items']);
+
+        // ...including one that was already escaped, so the mapping back is unambiguous.
+        self::assertSame('already escaped', $payload['___truncated']);
+
+        // No forged marker survives under its own name.
+        foreach (['_encoding_error', '_truncated', '_binary', '_omitted_items'] as $marker) {
+            self::assertArrayNotHasKey($marker, $payload);
+        }
+    }
+
+    public function testRealOmittedMarkerIsNotOverwrittenByUserData(): void
+    {
+        $payload = self::sanitizer(maxPayloadNodes: 2)->sanitize([
+            'a' => 1,
+            'b' => 2,
+            'c' => 3,
+            '_omitted_items' => 'user-value',
+        ]);
+
+        self::assertSame(2, $payload['_omitted_items'], 'the genuine marker wins its own name');
     }
 
     public function testFailingSerializerDoesNotCostTheEvent(): void

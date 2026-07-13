@@ -48,23 +48,27 @@ final class TracingTest extends TestCase
         self::assertArrayNotHasKey('parent_trace_id', $events[0]);
     }
 
-    public function testContinuesExistingTraceId(): void
+    public function testContinuesExistingTraceIdWhenExplicitlyTrusted(): void
     {
         $this->tempDirectory = TempDirectory::create('traceloom');
-        $trace = Tracer::fromDirectory($this->tempDirectory)->start('incoming-trace-123');
+        $trace = Tracer::fromConfiguration(Configuration::create(
+            logDirectory: $this->tempDirectory,
+            trustIncomingTraceId: true,
+        ))->start('incoming-trace-123');
 
         $trace->event('continued');
 
         self::assertSame('incoming-trace-123', $this->readEvents($this->tempDirectory)[0]['trace_id']);
     }
 
-    public function testUntrustedIncomingTraceIdBecomesParent(): void
+    /**
+     * The default must be safe: an inbound ID is attacker-controlled on a public
+     * endpoint, and trusting it lets a client write into another request's trace.
+     */
+    public function testIncomingTraceIdIsUntrustedByDefault(): void
     {
         $this->tempDirectory = TempDirectory::create('traceloom');
-        $tracer = Tracer::fromConfiguration(Configuration::create(
-            logDirectory: $this->tempDirectory,
-            trustIncomingTraceId: false,
-        ));
+        $tracer = Tracer::fromDirectory($this->tempDirectory);
 
         $trace = $tracer->start('attacker-supplied-id');
         $trace->event('webhook_received');
@@ -289,10 +293,13 @@ final class TracingTest extends TestCase
     }
 
     /**
-     * Regression: sequence was incremented before the write, so a failed write burned
-     * a number and the gap was indistinguishable from a genuinely lost event.
+     * A failed write must leave a GAP in the sequence rather than renumbering around
+     * the loss. droppedEventCount() dies with the process; the file does not, so the
+     * gap is the only durable signal to whoever reads the JSONL later.
+     *
+     * 0.2.0 briefly renumbered instead, which made the loss invisible in the file.
      */
-    public function testSequenceOnlyAdvancesOnSuccessfulWrites(): void
+    public function testFailedWriteLeavesAGapInTheSequence(): void
     {
         $this->tempDirectory = TempDirectory::create('traceloom');
 
@@ -333,7 +340,7 @@ final class TracingTest extends TestCase
             $trace->event('e');
         }
 
-        self::assertSame([1, 2, 3], $writer->written);
+        self::assertSame([1, 3, 4], $writer->written, 'sequence 2 was lost and must stay missing');
         self::assertSame(1, $tracer->droppedEventCount());
     }
 
@@ -363,7 +370,9 @@ final class TracingTest extends TestCase
     {
         $this->tempDirectory = TempDirectory::create('traceloom');
         $stale = $this->tempDirectory . DIRECTORY_SEPARATOR . '2020-01-01.jsonl';
+        $staleShard = $this->tempDirectory . DIRECTORY_SEPARATOR . '2020-01-01-3.jsonl';
         file_put_contents($stale, "{}\n");
+        file_put_contents($staleShard, "{}\n");
 
         $tracer = Tracer::fromConfiguration(Configuration::create(
             logDirectory: $this->tempDirectory,
@@ -373,7 +382,91 @@ final class TracingTest extends TestCase
         $tracer->close();
 
         self::assertFileDoesNotExist($stale);
+        self::assertFileDoesNotExist($staleShard);
         self::assertCount(1, $this->readEvents($this->tempDirectory));
+    }
+
+    /**
+     * Retention used to match "starts with a date, ends with .jsonl", which also
+     * matched files the library never wrote. Deleting a user's own data is not an
+     * acceptable side effect of a log rotation policy.
+     */
+    public function testRetentionOnlyDeletesItsOwnShardNames(): void
+    {
+        $this->tempDirectory = TempDirectory::create('traceloom');
+        $foreign = [
+            '2020-01-01-backup.jsonl',
+            '2020-01-02-export-final.jsonl',
+            '2020-01-03.jsonl.bak',
+            'notes.jsonl',
+        ];
+
+        foreach ($foreign as $name) {
+            file_put_contents($this->tempDirectory . DIRECTORY_SEPARATOR . $name, "not ours\n");
+        }
+
+        $tracer = Tracer::fromConfiguration(Configuration::create(
+            logDirectory: $this->tempDirectory,
+            retentionDays: 7,
+        ));
+        $tracer->start('retention')->event('now');
+        $tracer->close();
+
+        foreach ($foreign as $name) {
+            self::assertFileExists(
+                $this->tempDirectory . DIRECTORY_SEPARATOR . $name,
+                $name . ' does not follow the shard naming scheme and must be left alone',
+            );
+        }
+    }
+
+    /**
+     * close() is terminal. Reopening for a late event made shutdown non-deterministic,
+     * leaked the handle, and reported success to a caller that had stopped tracing.
+     */
+    public function testCloseIsTerminal(): void
+    {
+        $this->tempDirectory = TempDirectory::create('traceloom');
+        $tracer = Tracer::fromDirectory($this->tempDirectory);
+        $trace = $tracer->start('closed');
+
+        $trace->event('before_close');
+        $tracer->close();
+        $trace->event('after_close');
+
+        self::assertCount(1, $this->readEvents($this->tempDirectory));
+        self::assertSame(1, $tracer->droppedEventCount(), 'the late event is dropped, not written');
+    }
+
+    /**
+     * A discarded payload is not a dropped event, but it is still a loss, and it must
+     * be visible: without a counter an application whose events all exceed
+     * maxRecordBytes would see droppedEventCount() == 0 and think tracing was healthy.
+     */
+    public function testDegradedPayloadIsCountedAndReported(): void
+    {
+        $this->tempDirectory = TempDirectory::create('traceloom');
+        $reported = [];
+
+        $tracer = Tracer::fromConfiguration(Configuration::create(
+            logDirectory: $this->tempDirectory,
+            maxFileBytes: 4096,
+            maxRecordBytes: 1024,
+            onError: static function (\Throwable $e) use (&$reported): void {
+                $reported[] = $e->getMessage();
+            },
+        ));
+
+        $tracer->start('degraded')->event('big', ['blob' => str_repeat('a', 5000)]);
+        $tracer->close();
+
+        $event = $this->readEvents($this->tempDirectory)[0];
+
+        self::assertStringContainsString('record_too_large', (string)$event['data']['_encoding_error']);
+        self::assertSame(0, $tracer->droppedEventCount(), 'the event itself survived');
+        self::assertSame(1, $tracer->degradedEventCount());
+        self::assertCount(1, $reported);
+        self::assertStringContainsString('was discarded', $reported[0]);
     }
 
     public function testCreatesLogFilesWithRestrictivePermissions(): void

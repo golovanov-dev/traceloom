@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Golovanov\Traceloom\Tests\Integration;
 
+use Golovanov\Traceloom\Configuration;
 use Golovanov\Traceloom\Tests\TestSupport\TempDirectory;
 use Golovanov\Traceloom\Tracer;
 use PHPUnit\Framework\TestCase;
@@ -22,7 +23,10 @@ final class CliCommandTest extends TestCase
     public function testShowsTraceTimeline(): void
     {
         $this->tempDirectory = TempDirectory::create('traceloom-cli');
-        $tracer = Tracer::fromDirectory($this->tempDirectory);
+        $tracer = Tracer::fromConfiguration(Configuration::create(
+            logDirectory: $this->tempDirectory,
+            trustIncomingTraceId: true,
+        ));
         $trace = $tracer->start('cli-trace-123');
 
         $trace->event('request_start');
@@ -73,6 +77,34 @@ final class CliCommandTest extends TestCase
         self::assertStringNotContainsString("\033", $result['stdout']);
         self::assertStringContainsString('\x1B', $result['stdout']);
         self::assertStringContainsString('FAKE-ALERT', $result['stdout']);
+    }
+
+    /**
+     * U+202E reorders the text that follows it, so an event name can be made to read
+     * as a different one in the operator's terminal. U+2028/U+2029 break the
+     * one-event-per-line output. Neither is a C0 control, so escaping those is not enough.
+     */
+    public function testEscapesBidiAndUnicodeLineSeparators(): void
+    {
+        $this->tempDirectory = TempDirectory::create('traceloom-cli');
+        $line = json_encode([
+            'timestamp' => '2026-07-13T10:00:00.000000Z',
+            'trace_id' => 'bidi-trace-id',
+            'event' => "payment\u{202E}drawer_delete\u{2028}spoofed",
+            'sequence' => 1,
+            'elapsed_ms' => 0,
+            'data' => [],
+        ], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+
+        file_put_contents($this->tempDirectory . DIRECTORY_SEPARATOR . '2026-07-13.jsonl', $line . "\n");
+
+        $result = $this->eventtrace('show', 'bidi-trace-id', '--dir=' . $this->tempDirectory);
+
+        self::assertSame(0, $result['exitCode'], $result['stderr']);
+        self::assertStringNotContainsString("\u{202E}", $result['stdout']);
+        self::assertStringNotContainsString("\u{2028}", $result['stdout']);
+        self::assertStringContainsString('\u{202E}', $result['stdout']);
+        self::assertStringContainsString('\u{2028}', $result['stdout']);
     }
 
     public function testAggregatesMalformedLineWarnings(): void

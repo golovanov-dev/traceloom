@@ -50,8 +50,13 @@ final class Trace
     {
         $name = $this->normalizeName($name);
 
-        // Only I/O and payload handling are fail-safe. Everything above this point
-        // is a caller mistake and must surface.
+        // Claimed before the write, so a failed write leaves a GAP in the sequence
+        // rather than renumbering around the loss. The gap is the only durable signal
+        // a consumer of the JSONL gets: droppedEventCount() lives in this process's
+        // memory and dies with it, while the file outlives both.
+        $this->sequence++;
+
+        // Only payload handling and I/O are fail-safe; a caller mistake must surface.
         try {
             $now = $this->clock->now();
             $elapsedMs = ($this->clock->monotonicNs() - $this->startedAtNs) / 1_000_000;
@@ -61,7 +66,7 @@ final class Trace
                 traceId: $this->traceId,
                 parentTraceId: $this->parentTraceId,
                 name: $name,
-                sequence: $this->sequence + 1,
+                sequence: $this->sequence,
                 elapsedMs: $elapsedMs,
                 data: $this->sanitizer->sanitize($data),
             );
@@ -70,13 +75,7 @@ final class Trace
         } catch (\Throwable $exception) {
             $this->metrics->recordDroppedEvent();
             $this->handleFailure($exception);
-
-            return;
         }
-
-        // Advanced only after a successful write, so a gap in `sequence` always means
-        // a lost event rather than a consumed number.
-        $this->sequence++;
     }
 
     public function flush(): void

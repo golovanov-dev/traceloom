@@ -4,8 +4,16 @@ declare(strict_types=1);
 
 namespace Golovanov\Traceloom\Cli;
 
+use Golovanov\Traceloom\Support\Utf8;
+
 final class EventTraceCommand
 {
+    /**
+     * A damaged or hostile file may hold a "line" with no newline for gigabytes.
+     * This tool reads logs it did not necessarily write, so the read is bounded.
+     */
+    private const MAX_LINE_BYTES = 8 * 1024 * 1024;
+
     /**
      * @param list<string> $argv
      */
@@ -103,7 +111,15 @@ final class EventTraceCommand
                 continue;
             }
 
-            while (($line = fgets($handle)) !== false) {
+            while (($line = fgets($handle, self::MAX_LINE_BYTES)) !== false) {
+                if (!str_ends_with($line, "\n") && !feof($handle)) {
+                    // The line exceeds the cap. Discard the rest of it rather than
+                    // buffering it, and do not mistake its fragments for more lines.
+                    $this->skipToNewline($handle);
+                    $malformed++;
+                    continue;
+                }
+
                 // The trace ID is a literal substring of any line that mentions it, and
                 // this check is ~50x cheaper than decoding every line just to discard it.
                 if (!str_contains($line, $traceId)) {
@@ -150,6 +166,20 @@ final class EventTraceCommand
     }
 
     /**
+     * @param resource $handle
+     */
+    private function skipToNewline($handle): void
+    {
+        while (!feof($handle)) {
+            $chunk = fgets($handle, self::MAX_LINE_BYTES);
+
+            if ($chunk === false || str_ends_with($chunk, "\n")) {
+                return;
+            }
+        }
+    }
+
+    /**
      * @param list<array<string, mixed>> $events
      */
     private function printTimeline(string $traceId, array $events): void
@@ -190,23 +220,33 @@ final class EventTraceCommand
 
     /**
      * A log file is untrusted input for this command: it may hold event names built
-     * from request data. Printing raw bytes would let an ESC sequence repaint, clear
-     * or forge the operator's terminal.
+     * from request data, and it may not even have been written by this library.
+     *
+     * Escapes anything that can manipulate a terminal rather than print in it:
+     *  - C0 controls and DEL, which carry ANSI escape sequences (repaint, clear);
+     *  - Unicode format characters (\p{Cf}), notably U+202E RIGHT-TO-LEFT OVERRIDE,
+     *    which visually reorders text so one event name can masquerade as another;
+     *  - U+2028/U+2029, line separators that break the one-event-per-line output.
      */
     private static function safe(string $value): string
     {
-        $escaped = preg_replace_callback(
-            '/[\x00-\x1F\x7F]/',
-            static fn (array $m): string => sprintf('\x%02X', ord($m[0])),
-            $value,
-        );
-
-        if ($escaped === null) {
+        if (preg_match('//u', $value) !== 1) {
             return '[UNPRINTABLE]';
         }
 
-        // Anything left that is not valid UTF-8 would still confuse the terminal.
-        return preg_match('//u', $escaped) === 1 ? $escaped : '[UNPRINTABLE]';
+        $escaped = preg_replace_callback(
+            '/[\x00-\x1F\x7F]|\p{Cf}|\x{2028}|\x{2029}/u',
+            static function (array $matches): string {
+                $codepoint = Utf8::ord($matches[0]);
+
+                return $codepoint <= 0xFF
+                    ? sprintf('\x%02X', $codepoint)
+                    : sprintf('\u{%04X}', $codepoint);
+            },
+            $value,
+        );
+
+        return $escaped ?? '[UNPRINTABLE]';
     }
 
     private function formatTime(string $timestamp): string

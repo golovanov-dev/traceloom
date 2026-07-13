@@ -7,13 +7,13 @@ require __DIR__ . '/../vendor/autoload.php';
 use Golovanov\Traceloom\Configuration;
 use Golovanov\Traceloom\Tracer;
 
+// This endpoint is public, so the inbound header is attacker-controlled. The default
+// (trustIncomingTraceId: false) is what we want here: the incoming value is kept as
+// `parent_trace_id` and a fresh ID is generated, so a client cannot write its events
+// into someone else's trace. Behind a gateway that sets the header itself, pass
+// trustIncomingTraceId: true to carry one ID end to end.
 $tracer = Tracer::fromConfiguration(Configuration::create(
     logDirectory: __DIR__ . '/../logs',
-    // This endpoint is public, so the inbound header is attacker-controlled: without
-    // this, a client could write its events into someone else's trace. The incoming
-    // value is kept as `parent_trace_id`. Behind a trusted gateway that sets the
-    // header itself, leave this at its default (true) to keep one ID end to end.
-    trustIncomingTraceId: false,
 ));
 
 $incomingTraceId = $_SERVER['HTTP_X_TRACE_ID']

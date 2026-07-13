@@ -15,6 +15,13 @@ final class PayloadSanitizer
     private const KEY_CACHE_LIMIT = 512;
     private const BINARY_PREVIEW_BYTES = 32;
 
+    /**
+     * Keys the sanitizer writes itself. A payload may not spell them: a record that
+     * carried its own `_truncated` marker would be indistinguishable from one the
+     * sanitizer produced, which is both a reporting bug and a way to forge a log.
+     */
+    private const RESERVED_KEY_PATTERN = '/^_+(binary|truncated|encoding_error|omitted_items)$/D';
+
     /** @var array<string, string> */
     private array $keyCache = [];
 
@@ -22,8 +29,10 @@ final class PayloadSanitizer
     private readonly array $fragments;
 
     /**
-     * Remaining array entries this event may keep. A per-array cap would still allow
-     * maxArrayItems ** maxDepth nodes, so the budget spans the whole payload.
+     * Node budget left for the current event. Bounds the payload as a whole, which a
+     * per-array cap cannot do: that alone would still permit maxArrayItems ** maxDepth
+     * nodes. It is deliberately separate from maxArrayItems, which limits each array
+     * on its own so that one long list cannot swallow its sibling fields.
      */
     private int $budget = 0;
 
@@ -33,6 +42,7 @@ final class PayloadSanitizer
     public function __construct(
         private readonly int $maxStringBytes,
         private readonly int $maxArrayItems,
+        private readonly int $maxPayloadNodes,
         private readonly int $maxDepth,
         private readonly array $sensitiveKeyMap,
         private readonly bool $strictSensitiveKeys = false,
@@ -45,6 +55,7 @@ final class PayloadSanitizer
         return new self(
             maxStringBytes: $configuration->maxStringBytes,
             maxArrayItems: $configuration->maxArrayItems,
+            maxPayloadNodes: $configuration->maxPayloadNodes,
             maxDepth: $configuration->maxDepth,
             sensitiveKeyMap: $configuration->sensitiveKeyMap,
             strictSensitiveKeys: $configuration->strictSensitiveKeys,
@@ -57,12 +68,27 @@ final class PayloadSanitizer
      */
     public function sanitize(array $payload): array
     {
-        $this->budget = $this->maxArrayItems;
+        $this->budget = $this->maxPayloadNodes;
 
         /** @var array<string, mixed> $sanitized */
-        $sanitized = $this->normalizeArray($payload, 1, new \SplObjectStorage());
+        $sanitized = $this->normalizeMap($payload, 1, new \SplObjectStorage());
 
         return $sanitized;
+    }
+
+    /**
+     * A PHP list encodes to a JSON array, anything else to a JSON object, so the two
+     * are bounded by different limits — exactly as in the JS and Go implementations.
+     *
+     * @param array<mixed> $data
+     * @param \SplObjectStorage<object, null> $seen
+     * @return array<mixed>
+     */
+    private function normalizeArray(array $data, int $depth, \SplObjectStorage $seen): array
+    {
+        return array_is_list($data)
+            ? $this->normalizeList($data, $depth, $seen)
+            : $this->normalizeMap($data, $depth, $seen);
     }
 
     /**
@@ -70,25 +96,28 @@ final class PayloadSanitizer
      * @param \SplObjectStorage<object, null> $seen
      * @return array<mixed>
      */
-    private function normalizeArray(array $data, int $depth, \SplObjectStorage $seen): array
+    private function normalizeMap(array $data, int $depth, \SplObjectStorage $seen): array
     {
         $normalized = [];
         $omitted = 0;
+        $remaining = count($data);
 
         foreach ($data as $key => $value) {
             if ($this->budget <= 0) {
-                $omitted++;
-                continue;
+                // Everything still unvisited is omitted, not just this one entry.
+                $omitted = $remaining;
+                break;
             }
 
+            $remaining--;
             $this->budget--;
 
             if ($this->isSensitiveKey($key)) {
-                $normalized[$key] = Configuration::REDACTED;
+                $this->assign($normalized, $key, Configuration::REDACTED);
                 continue;
             }
 
-            $normalized[$key] = $this->normalizeValue($value, $depth + 1, $seen);
+            $this->assign($normalized, $key, $this->normalizeValue($value, $depth + 1, $seen));
         }
 
         if ($omitted > 0) {
@@ -96,6 +125,54 @@ final class PayloadSanitizer
         }
 
         return $normalized;
+    }
+
+    /**
+     * @param list<mixed> $data
+     * @param \SplObjectStorage<object, null> $seen
+     * @return list<mixed>
+     */
+    private function normalizeList(array $data, int $depth, \SplObjectStorage $seen): array
+    {
+        $normalized = [];
+        $total = count($data);
+        $omitted = 0;
+
+        foreach ($data as $index => $value) {
+            // Two independent limits: this array's own length, and the node budget for
+            // the payload as a whole, which stops a wide or deeply nested bomb.
+            if ($index >= $this->maxArrayItems || $this->budget <= 0) {
+                $omitted = $total - $index;
+                break;
+            }
+
+            $this->budget--;
+            $normalized[] = $this->normalizeValue($value, $depth + 1, $seen);
+        }
+
+        if ($omitted > 0) {
+            $normalized[] = ['_omitted_items' => $omitted];
+        }
+
+        return $normalized;
+    }
+
+    /**
+     * Writes a key that came from untrusted input. A key spelling a sanitizer marker
+     * gains a leading underscore, which is itself escaped on the way in, so the
+     * mapping back stays unambiguous.
+     *
+     * @param array<mixed> $target
+     */
+    private function assign(array &$target, int|string $key, mixed $value): void
+    {
+        if (is_string($key) && preg_match(self::RESERVED_KEY_PATTERN, $key) === 1) {
+            $target['_' . $key] = $value;
+
+            return;
+        }
+
+        $target[$key] = $value;
     }
 
     /**

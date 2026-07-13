@@ -12,6 +12,7 @@ final class Configuration
     public const DEFAULT_MAX_STRING_BYTES = 64 * 1024;
     public const DEFAULT_MAX_RECORD_BYTES = 256 * 1024;
     public const DEFAULT_MAX_ARRAY_ITEMS = 1000;
+    public const DEFAULT_MAX_PAYLOAD_NODES = 10000;
     public const DEFAULT_MAX_DEPTH = 16;
     public const DEFAULT_DIRECTORY_MODE = 0750;
     public const DEFAULT_FILE_MODE = 0640;
@@ -19,8 +20,16 @@ final class Configuration
     public const REDACTED = '[REDACTED]';
 
     /**
-     * Canonical fragments that mark a key as sensitive when it contains them.
-     * Only consulted when $strictSensitiveKeys is false.
+     * Substrings matched against canonicalized keys in non-strict mode. Kept free of
+     * short generic words such as `auth` (would redact `author`) and `key` (would
+     * redact `keyboard`, `monkey`, `key_count`); those spellings are covered by the
+     * exact list below instead.
+     *
+     * Kept in step with the JS and Go implementations: the same payload must be masked
+     * the same way whichever one writes the log. `jwt` is the one deliberate addition
+     * ahead of them — no English word contains it, so it carries no false-positive
+     * risk, and without it `jwt_value` reaches the log in clear text. JS and Go should
+     * adopt it.
      *
      * @var list<string>
      */
@@ -32,6 +41,12 @@ final class Configuration
         'apikey',
         'privatekey',
         'credential',
+        'authorization',
+        'cookie',
+        'session',
+        'bearer',
+        'signature',
+        'jwt',
     ];
 
     /** @var list<string> */
@@ -44,15 +59,21 @@ final class Configuration
         'refresh_token',
         'authorization',
         'proxy_authorization',
+        'auth',
+        'bearer',
+        'jwt',
         'cookie',
         'set_cookie',
         'api_key',
         'x_api_key',
+        'access_key',
+        'secret_key',
         'secret',
         'client_secret',
         'private_key',
         'credentials',
         'signature',
+        'session',
         'session_id',
         'csrf',
         'csrf_token',
@@ -67,6 +88,7 @@ final class Configuration
         public readonly int $maxStringBytes,
         public readonly int $maxRecordBytes,
         public readonly int $maxArrayItems,
+        public readonly int $maxPayloadNodes,
         public readonly int $maxDepth,
         public readonly array $sensitiveKeyMap,
         public readonly bool $strictSensitiveKeys,
@@ -88,13 +110,14 @@ final class Configuration
         int $maxStringBytes = self::DEFAULT_MAX_STRING_BYTES,
         int $maxRecordBytes = self::DEFAULT_MAX_RECORD_BYTES,
         int $maxArrayItems = self::DEFAULT_MAX_ARRAY_ITEMS,
+        int $maxPayloadNodes = self::DEFAULT_MAX_PAYLOAD_NODES,
         int $maxDepth = self::DEFAULT_MAX_DEPTH,
         array $sensitiveKeys = [],
         bool $strictSensitiveKeys = false,
         int $directoryMode = self::DEFAULT_DIRECTORY_MODE,
         int $fileMode = self::DEFAULT_FILE_MODE,
         int $retentionDays = 0,
-        bool $trustIncomingTraceId = true,
+        bool $trustIncomingTraceId = false,
         bool $failOnError = false,
         ?callable $onError = null,
     ): self {
@@ -104,6 +127,7 @@ final class Configuration
         self::assertPositive($maxStringBytes, 'Max string size');
         self::assertPositive($maxRecordBytes, 'Max record size');
         self::assertPositive($maxArrayItems, 'Max array items');
+        self::assertPositive($maxPayloadNodes, 'Max payload nodes');
         self::assertPositive($maxDepth, 'Max depth');
 
         if ($retentionDays < 0) {
@@ -123,6 +147,7 @@ final class Configuration
             maxStringBytes: $maxStringBytes,
             maxRecordBytes: $maxRecordBytes,
             maxArrayItems: $maxArrayItems,
+            maxPayloadNodes: $maxPayloadNodes,
             maxDepth: $maxDepth,
             sensitiveKeyMap: self::buildSensitiveKeyMap([...self::DEFAULT_SENSITIVE_KEYS, ...$sensitiveKeys]),
             strictSensitiveKeys: $strictSensitiveKeys,
