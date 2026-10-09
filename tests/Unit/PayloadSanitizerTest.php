@@ -168,6 +168,67 @@ final class PayloadSanitizerTest extends TestCase
         self::assertSame(['[REDACTED]'], array_values($payload));
     }
 
+    /**
+     * A key that is not UTF-8 used to reach json_encode() as is and cost the whole
+     * event. Each invalid byte becomes U+FFFD and the key takes the digest suffix of
+     * the original bytes, so keys differing only in invalid bytes, and a real key
+     * spelled with U+FFFD, all stay distinct.
+     */
+    public function testInvalidUtf8KeysBecomeDistinctValidKeys(): void
+    {
+        $payload = self::sanitizer()->sanitize([
+            "a\xE2\x82b" => 1,
+            "a\xE2\x83b" => 2,
+            "a\u{FFFD}\u{FFFD}b" => 3,
+        ]);
+
+        self::assertCount(3, $payload, 'no value may overwrite another');
+        self::assertSame([1, 2, 3], array_values($payload));
+        self::assertSame(3, $payload["a\u{FFFD}\u{FFFD}b"], 'a valid key is written as is');
+        self::assertSame(
+            1,
+            $payload["a\u{FFFD}\u{FFFD}b~" . substr(hash('sha256', "a\xE2\x82b"), 0, 16)],
+            'one U+FFFD per invalid byte, digest of the original key',
+        );
+        self::assertNotFalse(json_encode($payload, JSON_THROW_ON_ERROR));
+    }
+
+    /**
+     * Order: replace first, bound second. Each replaced byte grows to three, so a key
+     * within maxKeyBytes before the replacement can exceed it after.
+     */
+    public function testInvalidUtf8KeyIsBoundedAfterReplacement(): void
+    {
+        $key = str_repeat("\xFF", 40);
+        $payload = self::sanitizer(maxKeyBytes: 64)->sanitize([$key => 1]);
+
+        $written = (string)array_key_first($payload);
+
+        self::assertLessThanOrEqual(64, strlen($written));
+        self::assertSame(1, preg_match('//u', $written));
+        self::assertStringEndsWith('~' . substr(hash('sha256', $key), 0, 16), $written);
+
+        // Only the head is scrubbed; a code point at its edge is still cut whole.
+        $edge = str_repeat('a', 44) . "\u{1F600}\xFF";
+        $payload = self::sanitizer(maxKeyBytes: 64)->sanitize([$edge => 1]);
+
+        self::assertSame(
+            str_repeat('a', 44) . '~' . substr(hash('sha256', $edge), 0, 16),
+            array_key_first($payload),
+        );
+    }
+
+    /**
+     * Decided on the output key, strict mode would compare `password~<digest>` and
+     * miss the secret.
+     */
+    public function testInvalidUtf8KeyIsMaskedByItsOriginalSpelling(): void
+    {
+        $payload = self::sanitizer(strictSensitiveKeys: true)->sanitize(["\xFFpassword" => 'hunter2']);
+
+        self::assertSame(['[REDACTED]'], array_values($payload));
+    }
+
     public function testStrictModeMatchesWholeKeysOnly(): void
     {
         $lenient = self::sanitizer()->sanitize(['token_count' => 7]);

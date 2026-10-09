@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.0 - 2026-10-09
+
+Composer treats `^0.4` as `>=0.4.0 <0.5.0`: to take this release, raise the constraint to
+`^0.5`.
+
+### Added
+
+- `JsonlFileWriter::writeProblem(Configuration $configuration, ClockInterface $clock = new SystemClock()): ?string`
+  tells a health check whether the process can write today's trace, and if not, why
+  (the directory, the lock file or the current shard), without creating a file or
+  changing a permission. Use it instead of checking `.traceloom.lock` and
+  `Y-m-d[-N].jsonl` names yourself; see [Checking That Traces Can Be Written](README.md#checking-that-traces-can-be-written).
+
+### Fixed
+
+- **A payload key that is not valid UTF-8 no longer costs the whole event its data.**
+  Such a key (a cp1251 form field, `?%E8%EC%FF=1`) made the record unencodable and
+  degraded it to `_encoding_error`. Each invalid byte now becomes U+FFFD and the key
+  takes the same `~<digest>` suffix as an over-long key, so it cannot overwrite another
+  key: `"\xE8\xEC\xFF"` is written as `"���~<16 hex>"`. If you strip invalid bytes from
+  keys before tracing, you no longer need to.
+
 ## 0.4.0 - 2026-07-13
 
 ### Added

@@ -12,9 +12,35 @@ namespace Golovanov\Traceloom\Support;
  */
 final class Utf8
 {
+    /**
+     * A run of well-formed UTF-8 sequences, matched byte by byte (no /u modifier).
+     */
+    private const VALID_RUN = '(?:[\x00-\x7F]|[\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]'
+        . '|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}'
+        . '|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})++';
+
     public static function isValid(string $value): bool
     {
         return preg_match('//u', $value) === 1;
+    }
+
+    /**
+     * Replaces every byte that is not part of a well-formed UTF-8 sequence with
+     * U+FFFD, one replacement per byte — the same result Go's encoding/json gives.
+     */
+    public static function scrub(string $value): string
+    {
+        $scrubbed = preg_replace_callback(
+            '/(' . self::VALID_RUN . ')|./s',
+            static fn (array $match): string => ($match[1] ?? '') !== '' ? $match[1] : "\u{FFFD}",
+            $value,
+        );
+
+        if ($scrubbed === null) {
+            throw new \RuntimeException('Unable to scrub invalid UTF-8: ' . preg_last_error_msg());
+        }
+
+        return $scrubbed;
     }
 
     /**

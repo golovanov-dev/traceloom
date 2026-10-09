@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Golovanov\Traceloom\Writer;
 
+use Golovanov\Traceloom\Clock\ClockInterface;
+use Golovanov\Traceloom\Clock\SystemClock;
 use Golovanov\Traceloom\Configuration;
 use Golovanov\Traceloom\Exception\TracingException;
 use Golovanov\Traceloom\Metrics;
@@ -121,6 +123,67 @@ final class JsonlFileWriter implements WriterInterface
     }
 
     /**
+     * Why this process could not write an event into $configuration's log directory
+     * today, or null when it could. For health checks: it only looks, creating no
+     * file and changing no permission.
+     *
+     * Checks what a write needs: the directory (or, while it does not exist, the
+     * nearest existing parent it would be created in) must be writable, because a new
+     * shard is created every UTC day and on rotation; the lock file and the shard the
+     * next write appends to must be writable if they exist. Today is the UTC date of
+     * $clock, the same date a write would use.
+     */
+    public static function writeProblem(
+        Configuration $configuration,
+        ClockInterface $clock = new SystemClock(),
+    ): ?string {
+        clearstatcache();
+
+        $directory = $configuration->logDirectory;
+
+        if (!file_exists($directory)) {
+            $parent = dirname($directory);
+
+            while (!file_exists($parent) && dirname($parent) !== $parent) {
+                $parent = dirname($parent);
+            }
+
+            return is_dir($parent) && is_writable($parent)
+                ? null
+                : 'Log directory cannot be created: ' . $directory;
+        }
+
+        if (!is_dir($directory)) {
+            return 'Log path exists but is not a directory: ' . $directory;
+        }
+
+        if (!is_writable($directory)) {
+            return 'Log directory is not writable: ' . $directory;
+        }
+
+        $lock = $directory . DIRECTORY_SEPARATOR . self::LOCK_FILE;
+
+        if (file_exists($lock) && !(is_file($lock) && is_readable($lock) && is_writable($lock))) {
+            return 'Lock file is not readable and writable: ' . $lock;
+        }
+
+        $date = $clock->now()->setTimezone(new \DateTimeZone('UTC'))->format('Y-m-d');
+        [$shard] = self::selectShard(
+            $directory,
+            $date,
+            self::discoverShardIndex($directory, $date),
+            1,
+            $configuration->maxFileBytes,
+        );
+
+        if (file_exists($shard) && !(is_file($shard) && is_writable($shard))) {
+            return 'Log file is not writable: ' . $shard;
+        }
+
+        return null;
+    }
+
+    /**
      * Releases the handle without ending the writer's life, so rotation can reopen
      * on a different shard. close() is the terminal operation; this is not.
      */
@@ -199,9 +262,15 @@ final class JsonlFileWriter implements WriterInterface
             // New day: locate the highest existing shard once.
             $index = $previousDate === $date
                 ? $this->currentIndex
-                : $this->discoverShardIndex($directory, $date);
+                : self::discoverShardIndex($directory, $date);
 
-            [$path, $size] = $this->selectShard($directory, $date, $index, $bytes);
+            [$path, $size, $this->currentIndex] = self::selectShard(
+                $directory,
+                $date,
+                $index,
+                $bytes,
+                $this->configuration->maxFileBytes,
+            );
 
             $existed = is_file($path);
             $handle = $this->open($path, 'ab');
@@ -224,20 +293,21 @@ final class JsonlFileWriter implements WriterInterface
     }
 
     /**
-     * @return array{0: string, 1: int} Path and its current size.
+     * @return array{0: string, 1: int, 2: int} Path, its current size and its index.
      */
-    private function selectShard(string $directory, string $date, int $index, int $bytes): array
-    {
-        $maxFileBytes = $this->configuration->maxFileBytes;
-
+    private static function selectShard(
+        string $directory,
+        string $date,
+        int $index,
+        int $bytes,
+        int $maxFileBytes,
+    ): array {
         for (; ; $index++) {
-            $path = $this->shardPath($directory, $date, $index);
-            $size = $this->fileSize($path);
+            $path = self::shardPath($directory, $date, $index);
+            $size = self::fileSize($path);
 
             if ($size === 0 || $size + $bytes <= $maxFileBytes) {
-                $this->currentIndex = $index;
-
-                return [$path, $size];
+                return [$path, $size, $index];
             }
         }
     }
@@ -246,7 +316,7 @@ final class JsonlFileWriter implements WriterInterface
      * Finds the highest existing shard for a date with one glob() instead of
      * walking every shard with a stat() on every single event.
      */
-    private function discoverShardIndex(string $directory, string $date): int
+    private static function discoverShardIndex(string $directory, string $date): int
     {
         $files = glob($directory . DIRECTORY_SEPARATOR . $date . '*.jsonl');
 
@@ -271,7 +341,7 @@ final class JsonlFileWriter implements WriterInterface
         return $highest;
     }
 
-    private function shardPath(string $directory, string $date, int $index): string
+    private static function shardPath(string $directory, string $date, int $index): string
     {
         $suffix = $index === 0 ? '' : '-' . $index;
 
@@ -420,7 +490,7 @@ final class JsonlFileWriter implements WriterInterface
         return $handle;
     }
 
-    private function fileSize(string $path): int
+    private static function fileSize(string $path): int
     {
         clearstatcache(true, $path);
 

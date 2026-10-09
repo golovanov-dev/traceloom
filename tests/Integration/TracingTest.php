@@ -167,6 +167,20 @@ final class TracingTest extends TestCase
      * Regression: a self-referencing payload killed the process with a fatal error
      * that no catch block could intercept.
      */
+    public function testInvalidUtf8KeyDoesNotDegradeTheEvent(): void
+    {
+        $this->tempDirectory = TempDirectory::create('traceloom');
+        $tracer = Tracer::fromDirectory($this->tempDirectory);
+
+        $tracer->start()->event('form', ['query' => ["\xE8\xEC\xFF" => '1'], 'method' => 'POST']);
+
+        $data = $this->readEvents($this->tempDirectory)[0]['data'];
+
+        self::assertSame('POST', $data['method']);
+        self::assertSame(['1'], array_values($data['query']));
+        self::assertSame(0, $tracer->degradedEventCount());
+    }
+
     public function testCircularPayloadDoesNotKillTheProcess(): void
     {
         $this->tempDirectory = TempDirectory::create('traceloom');

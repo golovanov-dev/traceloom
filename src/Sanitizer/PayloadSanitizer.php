@@ -117,8 +117,8 @@ final class PayloadSanitizer
             $remaining--;
             $this->budget--;
 
-            // Sensitivity is decided on the ORIGINAL key: truncation must never be a
-            // way to smuggle a secret past the mask.
+            // Sensitivity is decided on the ORIGINAL key: truncation or the digest
+            // suffix must never be a way to smuggle a secret past the mask.
             $sensitive = $this->isSensitiveKey($key);
             $outKey = $this->normalizeKey($key);
 
@@ -168,7 +168,7 @@ final class PayloadSanitizer
     }
 
     /**
-     * Bounds an over-long key.
+     * Bounds an over-long key and makes a key that is not valid UTF-8 encodable.
      *
      * Keys were the one unbounded dimension left in the sanitizer: a single 200 KB key
      * could push a record past maxRecordBytes and degrade the entire payload to an
@@ -181,15 +181,32 @@ final class PayloadSanitizer
      * WHOLE original key, which keeps distinct keys distinct. The result is still an
      * ordinary string key, so no JSONL consumer has to change, and the mapping is
      * deterministic across processes, runs and the PHP/JS/Go implementations alike.
+     *
+     * A key that is not valid UTF-8 (a cp1251 form field, `?%E8%EC%FF=1`) would make
+     * json_encode() reject the record and cost every field of the event. Its invalid
+     * bytes become U+FFFD, and it takes the same digest suffix: two such keys would
+     * otherwise collapse into one, or onto an existing key spelled with U+FFFD. The
+     * replacement comes first and the bound second, because each replaced byte grows
+     * to three; the digest is always taken over the original bytes.
      */
     private function normalizeKey(int|string $key): int|string
     {
-        if (!is_string($key) || strlen($key) <= $this->maxKeyBytes) {
+        if (!is_string($key)) {
+            return $key;
+        }
+
+        $valid = Utf8::isValid($key);
+
+        if ($valid && strlen($key) <= $this->maxKeyBytes) {
             return $key;
         }
 
         $digest = substr(hash('sha256', $key), 0, 16);
-        $head = Utf8::truncate($key, $this->maxKeyBytes - self::KEY_DIGEST_SUFFIX_BYTES);
+        $headBytes = $this->maxKeyBytes - self::KEY_DIGEST_SUFFIX_BYTES;
+        // Only the head is kept, so only the head is scrubbed: a hostile megabyte key
+        // costs one substr(). Three extra bytes complete a sequence cut by the substr().
+        $readable = $valid ? $key : Utf8::scrub(substr($key, 0, $headBytes + 3));
+        $head = Utf8::truncate($readable, $headBytes);
 
         return $head . '~' . $digest;
     }

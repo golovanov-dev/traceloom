@@ -230,6 +230,19 @@ The result is an ordinary string key — no JSONL consumer has to change — and
 is deterministic across processes, runs, and the PHP, JS and Go implementations alike.
 Masking is decided on the original key, so truncation cannot smuggle a secret past it.
 
+A key that is not valid UTF-8 (a cp1251 form field, `?%E8%EC%FF=1`) gets the same
+treatment: each invalid byte becomes U+FFFD, then the key is bounded by `maxKeyBytes`,
+and the digest of the original bytes is appended, so two such keys, or such a key and
+a real one spelled with U+FFFD, never overwrite each other:
+
+```text
+"\xE8\xEC\xFF"  →  "���~<16 hex digits>"
+```
+
+Masking is decided on the original key here too. The cross-implementation guarantee
+above covers valid UTF-8 keys only: for invalid ones the PHP mapping is fixed, but the
+JS and Go implementations do not yet produce the same key.
+
 If a whole event still cannot be encoded, its `data` is replaced with
 `{"_encoding_error": "..."}` so the event stays in the timeline instead of vanishing.
 That is a real loss of data, so it is counted — see [Error Handling](#error-handling).
@@ -307,6 +320,44 @@ incomplete.
 it releases the file handle, and events recorded afterwards are rejected and counted as
 dropped rather than silently reopening the file. The handle is also flushed and closed
 when the tracer is destroyed, so calling either is optional.
+
+## Checking That Traces Can Be Written
+
+A health check can ask whether this process can write today's trace, without writing
+one:
+
+```php
+use Golovanov\Traceloom\Configuration;
+use Golovanov\Traceloom\Writer\JsonlFileWriter;
+
+$problem = JsonlFileWriter::writeProblem(Configuration::create(logDirectory: __DIR__ . '/logs'));
+
+if ($problem !== null) {
+    // e.g. "Log file is not writable: /app/logs/2026-07-10-1.jsonl"
+}
+```
+
+`writeProblem()` returns the first problem it finds, or `null` if it finds none. It
+checks that the log directory is writable (a missing one counts when its nearest existing
+parent is, since the writer creates it), and that the lock file and today's current shard
+are writable if they exist. It creates no file and changes no permission.
+
+This is a permission check, not a guarantee: `null` does not promise that the next write
+succeeds (a full disk, an ACL the check cannot see), and a reported problem does not
+always mean it fails. Treat it as a signal for a health check, and keep watching
+`droppedEventCount()`.
+
+Run the check in the process that writes the traces, as the same user. A check from a
+CLI command or cron job under another user can pass while PHP-FPM drops events.
+
+Pass the configuration your tracer uses: the current shard depends on `maxFileBytes`.
+`Tracer::fromDirectory($dir)` is the same as
+`Tracer::fromConfiguration(Configuration::create(logDirectory: $dir))`, so for such a
+tracer pass `Configuration::create(logDirectory: $dir)`.
+
+"Today" is the UTC date, as for the shard names, taken from the system clock. Pass a
+second argument only if you built the tracer with `new Tracer(...)` and your own clock:
+give the same `Golovanov\Traceloom\Clock\ClockInterface` instance.
 
 ## When Not To Use Traceloom
 
